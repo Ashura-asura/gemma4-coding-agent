@@ -1,0 +1,36 @@
+# GRPO RL hyperparameters — ARCHITECTURE.md §2.5
+
+policy_checkpoint: checkpoints/sft   # policy initialized from frozen SFT adapter
+frozen_sft_baseline: checkpoints/sft # kept as fallback if RL destabilizes (§8.3)
+
+algorithm: grpo
+
+rollout:
+  task_pool: data/rl_task_pool.jsonl
+  dev_slice: null             # dev slice for mid-RL gate — NEVER the frozen holdout (§8.2)
+  k: 8                        # group size: trajectories per task
+  max_steps: 30               # step budget per episode (§2.2)
+  max_tokens_per_step: 2048
+  temperature: 1.0
+
+reward:
+  # Primary weight dominant; validity secondary; step penalty small (§2.5).
+  test_pass: 1.0
+  patch_validity: 0.15
+  step_penalty: 0.005         # per step taken, discourages runaway tool loops
+  no_submit_penalty: 0.1
+
+training:
+  learning_rate: 1.0e-5
+  batch_tasks: 4              # tasks per update step; k rollouts each
+  num_updates: 200
+  kl_coeff: 0.01              # KL to frozen SFT reference, guards collapse (§8.3)
+  max_grad_norm: 1.0
+  precision: bfloat16
+  seed: 0
+
+checkpointing:
+  output_dir: checkpoints/rl
+  save_every_updates: 25      # free-tier sessions have hard limits (§5)
+  resume_from: null
+  eval_dev_every_updates: 25  # catch flat/negative trend early (§8.2 mid-RL gate)

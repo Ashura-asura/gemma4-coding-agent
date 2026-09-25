@@ -1,0 +1,24 @@
+# Evaluation harness — ARCHITECTURE.md §2.6
+# Runs the FROZEN held-out split only. No gradient updates.
+
+holdout_path: data/holdout_tasks.jsonl   # read-only; built once by data/scripts/build_holdout_split.py
+model_checkpoint: null                   # rung being scored: base, checkpoints/sft, or checkpoints/rl
+
+rollout:
+  max_steps: 30
+  max_tokens_per_step: 2048
+  temperature: 0.2
+  n_trials: 1              # raise only for sampling-strategy ablation (§8.1 Rung 4)
+
+report:
+  output_dir: eval/results
+  metrics:
+    - resolved_rate
+    - avg_steps_to_submit
+    - patch_validity_rate
+    - per_repo_breakdown
+  failure_categories:      # §2.7 failure-mode analysis
+    - wrong_file
+    - incomplete_patch
+    - test_environment_issue
+    - step_budget_exhaustion

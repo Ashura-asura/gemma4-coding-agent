@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemma4-coding-agent"
+version = "0.1.0"
+description = "Gemma-4 coding agent for the Kaggle Developer Agent Competition"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+train = [
+    "torch",
+    "transformers",
+    "peft",
+    "trl",
+    "datasets",
+    "accelerate",
+    "bitsandbytes",
+]
+
+[tool.setuptools]
+packages = [
+    "agent",
+    "agent.tools",
+    "sandbox",
+    "train",
+    "train.sft",
+    "train.rl",
+    "eval",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["sandbox/tests", "agent/tests", "eval/tests"]
+addopts = "-q"

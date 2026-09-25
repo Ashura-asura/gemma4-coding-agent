@@ -1,0 +1,44 @@
+# QLoRA SFT hyperparameters — ARCHITECTURE.md §2.4
+# Base model: Gemma-4 12B primary target; E4B fallback if 12B is tight (§0.3, §5).
+
+base_model: null            # set to local path or hub id, e.g. "google/gemma-4-12b-it"
+base_model_fallback: null   # E4B path, used if 12B OOMs once optimizer state is added
+
+method: qlora
+quantization:
+  bits: 4
+  compute_dtype: bfloat16
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+training:
+  epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  max_seq_len: 8192
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  seed: 0
+  resume_from: null         # set to adapter dir to resume after a quota timeout (§5)
+
+data:
+  path: data/sft_trajectories.jsonl
+  # Loss on model tool-call/reasoning tokens only; prompt + observations masked (§2.4).
+
+output_dir: checkpoints/sft
+save_every_steps: 100
+logging_every_steps: 10

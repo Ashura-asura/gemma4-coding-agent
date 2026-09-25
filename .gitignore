@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# artifacts — regenerate, never commit
+checkpoints/sft/*
+checkpoints/rl/*
+!checkpoints/sft/.gitkeep
+!checkpoints/rl/.gitkeep
+eval/results/
+
+# raw datasets stay local; only the built splits are tracked (ARCHITECTURE §4)
+data/raw/*
+!data/raw/.gitkeep
