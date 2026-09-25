@@ -192,8 +192,15 @@ class Sandbox:
         cwd: str | Path | None = None,
         timeout: float | None = None,
         extra_env: dict[str, str] | None = None,
+        pythonpath: Sequence[str] | None = None,
     ) -> ExecResult:
-        """Run ``argv`` and always return a typed :class:`ExecResult`."""
+        """Run ``argv`` and always return a typed :class:`ExecResult`.
+
+        ``pythonpath`` is the one sanctioned way to put import roots in front
+        of site-packages (src-layout checkouts). Every entry must resolve
+        inside the sandbox root; :data:`ENV_ALLOWLIST` still drops any
+        ``PYTHONPATH`` smuggled through ``extra_env``.
+        """
         started = time.monotonic()
         payload = tuple(argv) if argv is not None else ()
 
@@ -241,6 +248,14 @@ class Sandbox:
             return _reject("timeout must be positive")
 
         env = self._build_env(extra_env)
+        if pythonpath:
+            try:
+                roots = [str(self.resolve_path(entry)) for entry in pythonpath]
+            except SandboxError as exc:
+                return _reject(f"pythonpath rejected: {exc}")
+            if roots:
+                prior = env.get("PYTHONPATH")
+                env["PYTHONPATH"] = os.pathsep.join(roots + ([prior] if prior else []))
 
         with tempfile.TemporaryDirectory(prefix="sbox-") as tmp:
             status_path = Path(tmp) / "isolation.json"

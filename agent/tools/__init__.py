@@ -27,10 +27,19 @@ class Tool(Protocol):
 
 @dataclass
 class ToolEnv:
-    """State shared by the tools of one episode."""
+    """State shared by the tools of one episode.
+
+    ``test_base`` / ``test_targets`` come from the task record so the agent
+    runs *that* task's suite (§2.2). ``test_pythonpath`` puts the checkout's
+    own packages (root, ``src/``) in front of site-packages. When unset,
+    ``run_tests`` falls back to the default pytest command.
+    """
 
     sandbox: Sandbox
     submitted_patch: str | None = None
+    test_base: list[str] | None = None
+    test_targets: list[str] | None = None
+    test_pythonpath: list[str] | None = None
 
 
 def validate_call(tool: Tool, arguments: dict[str, Any]) -> dict[str, Any]:

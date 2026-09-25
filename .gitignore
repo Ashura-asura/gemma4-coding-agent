@@ -15,3 +15,8 @@ eval/results/
 # raw datasets stay local; only the built splits are tracked (ARCHITECTURE §4)
 data/raw/*
 !data/raw/.gitkeep
+data/work/
+data/venvs/
+
+# local archives
+*.zip

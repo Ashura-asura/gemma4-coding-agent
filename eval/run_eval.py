@@ -32,17 +32,23 @@ import yaml
 from agent.context import ToolCall
 from agent.loop import Policy, ScriptedPolicy, run_episode
 from agent.tools import ToolEnv, build_toolset
-from agent.tools.edit_file import apply_unified_diff
+from agent.tools.edit_file import PatchError, apply_patch_to_tree, split_multifile_patch
 from agent.tools.run_tests import DEFAULT_TEST_COMMAND, TEST_TIMEOUT_S
 from eval.report import format_report, summarize
 from sandbox import Limits, Sandbox
 
+__all__ = [
+    "PatchError",
+    "apply_patch_to_tree",
+    "split_multifile_patch",
+    "load_tasks",
+    "score_submission",
+    "evaluate_task",
+    "parse_tool_call",
+]
+
 DEFAULT_MAX_STEPS = 30
 DEFAULT_TEMPERATURE = 0.2
-
-
-class PatchError(Exception):
-    """The submitted patch could not be applied to a fresh checkout."""
 
 
 # --------------------------------------------------------------------- tasks
@@ -61,6 +67,91 @@ def load_tasks(path: str | Path) -> list[dict[str, Any]]:
     return tasks
 
 
+def task_test_config(task: dict[str, Any], *, python: str | None = None) -> tuple[list[str], list[str]]:
+    """Build (argv base, targets) for this task's test suite (§2.2, §2.6)."""
+    interpreter = python or task.get("python") or _venv_python(task) or sys.executable
+    runner = str(task.get("test_runner", "pytest"))
+    raw = task.get("test_target") or []
+    targets = [raw] if isinstance(raw, str) else [str(t) for t in raw]
+    if runner == "django":
+        base = [interpreter, "tests/runtests.py", "--verbosity", "1", "--parallel", "1"]
+    elif runner == "pytest-k":
+        base = [interpreter, "-m", "pytest", "-q"]
+        expr = str(task.get("test_k_expr", "") or "")
+        if expr:
+            base += ["-k", expr]
+    else:
+        base = [interpreter, "-m", "pytest", "-q"]
+    return base, targets
+
+
+def _venv_python(task: dict[str, Any]) -> str | None:
+    """Interpreter for this task's repo: record override, its venv, or none."""
+    if task.get("python"):
+        return str(task["python"])
+    if task.get("venv"):
+        from data.scripts.common import venv_python
+
+        return str(venv_python(str(task["venv"])))
+    return None
+
+
+def task_project(task: dict[str, Any]) -> str | None:
+    """GitHub ``owner/name`` behind the task, if the record carries a URL."""
+    url = task.get("repo_url")
+    if not url:
+        return None
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", str(url))
+    return match.group(1) if match else None
+
+
+def task_checkout_dir(task: dict[str, Any]) -> Path:
+    """Where this task's persistent checkout lives.
+
+    Phase 2 records use ``repo`` for the GitHub slug and ``checkout`` for the
+    local path; older records stored the path directly in ``repo``.
+    """
+    if task.get("checkout"):
+        return Path(str(task["checkout"]))
+    local = Path(str(task["repo"]))
+    if local.is_dir() or not task.get("repo_url"):
+        return local
+    from data.scripts.common import CHECKOUT_DIR, slugify
+
+    name = str(task.get("task_id") or slugify(str(task["repo"])))
+    return CHECKOUT_DIR / name / "repo"
+
+
+def ensure_task_environment(task: dict[str, Any]) -> str | None:
+    """Create the task's venv (and its repo's deps) once. Error or None."""
+    try:
+        project = task_project(task)
+        if project:
+            from data.scripts.common import ensure_venv
+
+            ensure_venv(project)
+        elif task.get("venv"):
+            from data.scripts.common import ensure_venv_by_slug
+
+            ensure_venv_by_slug(str(task["venv"]))
+    except Exception as exc:  # noqa: BLE001 - surfaced as a typed eval error
+        return f"environment setup failed: {type(exc).__name__}: {exc}"
+    return None
+
+
+def materialize_repo(task: dict[str, Any]) -> Path:
+    """Return a local checkout for the task, archiving it in if needed."""
+    repo = task_checkout_dir(task)
+    if repo.is_dir():
+        return repo
+    if not task.get("repo_url") or not task.get("base_commit"):
+        raise FileNotFoundError(f"repo checkout not found: {repo}")
+    from data.scripts.common import checkout_instance
+
+    checkout_instance(str(task["repo_url"]), str(task["base_commit"]), repo)
+    return repo
+
+
 def describe_repo(root: Path, max_files: int = 80) -> str:
     """Compact file listing handed to the model as repo_state."""
     files: list[str] = []
@@ -77,58 +168,6 @@ def describe_repo(root: Path, max_files: int = 80) -> str:
     return "\n".join(files)
 
 
-# --------------------------------------------------------------------- patch
-def split_multifile_patch(patch: str) -> dict[str, str]:
-    """Split a multi-file unified diff into {path: diff} sections."""
-    lines = patch.replace("\r\n", "\n").split("\n")
-    sections: list[tuple[str | None, list[str]]] = []
-    current: list[str] = []
-    target: str | None = None
-    for line in lines:
-        if line.startswith("--- "):
-            if current:
-                sections.append((target, current))
-            current, target = [line], None
-            continue
-        if not current:
-            if line.strip():
-                current = [line]  # "diff --git ..." preamble
-            continue
-        current.append(line)
-        if target is None and line.startswith("+++ "):
-            match = re.match(r"\+\+\+ (?:[ab]/)?(\S+)", line)
-            if match and match.group(1) != "/dev/null":
-                target = match.group(1)
-    if current:
-        sections.append((target, current))
-    return {path: "\n".join(body) for path, body in sections if path}
-
-
-def apply_patch_to_tree(patch: str, root: Path) -> list[str]:
-    """Apply every section of ``patch`` under ``root``. Atomic per file."""
-    sections = split_multifile_patch(patch)
-    if not sections:
-        raise PatchError("patch contains no file sections")
-    applied: list[str] = []
-    root_resolved = root.resolve()
-    for rel, diff in sections.items():
-        rel_path = Path(rel)
-        if rel_path.is_absolute() or ".." in rel_path.parts:
-            raise PatchError(f"patch path escapes the repository: {rel}")
-        target = (root / rel_path).resolve()
-        if target != root_resolved and root_resolved not in target.parents:
-            raise PatchError(f"patch path escapes the repository: {rel}")
-        original = target.read_text(encoding="utf-8") if target.exists() else ""
-        try:
-            updated = apply_unified_diff(original, diff)
-        except Exception as exc:  # ToolError and friends
-            raise PatchError(f"{rel}: {exc}") from exc
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(updated, encoding="utf-8", newline="")
-        applied.append(rel)
-    return applied
-
-
 # ------------------------------------------------------------------- scoring
 def score_submission(
     task: dict[str, Any],
@@ -137,7 +176,8 @@ def score_submission(
     limits: Limits | None = None,
     test_timeout: float = TEST_TIMEOUT_S,
 ) -> dict[str, Any]:
-    """Apply the patch to a fresh checkout and run the task's tests there."""
+    """Apply the task's test patch *and* the submitted patch to a fresh
+    checkout, then run the task's tests there (§2.5 primary reward source)."""
     if not patch or not patch.strip():
         return {
             "patch_valid": False,
@@ -146,18 +186,43 @@ def score_submission(
             "reason": "empty or missing patch",
         }
 
-    repo = Path(task["repo"])
-    if not repo.is_dir():
+    env_error = ensure_task_environment(task)
+    if env_error:
         return {
             "patch_valid": False,
             "resolved": False,
             "test_status": "error",
-            "reason": f"repo checkout not found: {repo}",
+            "reason": env_error,
         }
+
+    try:
+        repo = materialize_repo(task)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a typed eval error
+        return {
+            "patch_valid": False,
+            "resolved": False,
+            "test_status": "error",
+            "reason": f"checkout failed: {type(exc).__name__}: {exc}",
+        }
+
+    from data.scripts.common import prepare_checkout, pythonpath_for
 
     with tempfile.TemporaryDirectory(prefix="score-") as tmp:
         fresh = Path(tmp) / "repo"
         shutil.copytree(repo, fresh)
+
+        test_patch = str(task.get("test_patch") or "")
+        if test_patch:
+            try:
+                apply_patch_to_tree(test_patch, fresh)
+            except PatchError as exc:
+                return {
+                    "patch_valid": False,
+                    "resolved": False,
+                    "test_status": "error",
+                    "reason": f"task test patch does not apply: {exc}",
+                }
+
         try:
             applied = apply_patch_to_tree(patch, fresh)
         except PatchError as exc:
@@ -175,22 +240,30 @@ def score_submission(
                 "reason": "patch touched no files",
             }
 
-        argv = list(DEFAULT_TEST_COMMAND)
-        target = task.get("test_target")
-        if target:
-            base, sep, rest = str(target).partition("::")
-            base_path = Path(base)
-            if base_path.is_absolute() or ".." in base_path.parts:
+        project = task_project(task)
+        if project:
+            try:
+                prepare_checkout(project, fresh)
+            except Exception as exc:  # noqa: BLE001
                 return {
                     "patch_valid": False,
                     "resolved": False,
                     "test_status": "error",
-                    "reason": f"task test_target escapes the repo: {target}",
+                    "reason": f"checkout prep failed: {type(exc).__name__}: {exc}",
                 }
-            argv.append(base + (sep + rest if sep else ""))
+
+        base, targets = task_test_config(task)
+        runner = str(task.get("test_runner", "pytest"))
+        if not targets and runner != "pytest":
+            return {
+                "patch_valid": True,
+                "resolved": False,
+                "test_status": "error",
+                "reason": "task defines no test targets",
+            }
 
         sandbox = Sandbox(fresh, limits=limits)
-        result = sandbox.run(argv, timeout=test_timeout)
+        result = sandbox.run(base + targets, timeout=test_timeout, pythonpath=pythonpath_for(fresh))
         return {
             "patch_valid": True,
             "resolved": result.status == "pass",
@@ -315,10 +388,11 @@ def evaluate_task(
     limits: Limits | None = None,
     dump_trajectory: bool = False,
 ) -> dict[str, Any]:
-    repo = Path(task["repo"])
+    from data.scripts.common import prepare_checkout, pythonpath_for
+
     record: dict[str, Any] = {
         "task_id": task["task_id"],
-        "repo": str(repo),
+        "repo": str(task["repo"]),
         "status": "error",
         "steps": 0,
         "error": None,
@@ -328,16 +402,52 @@ def evaluate_task(
         "test_status": "error",
         "reason": "not run",
     }
-    if not repo.is_dir():
-        record["error"] = f"repo checkout not found: {repo}"
+
+    env_error = ensure_task_environment(task)
+    if env_error:
+        record["error"] = env_error
+        record["reason"] = env_error
+        return record
+
+    try:
+        repo = materialize_repo(task)
+    except Exception as exc:  # noqa: BLE001 - surfaced as a typed eval error
+        record["error"] = f"checkout failed: {type(exc).__name__}: {exc}"
         record["reason"] = record["error"]
         return record
+    record["repo"] = str(repo)
+
+    base, targets = task_test_config(task)
 
     with tempfile.TemporaryDirectory(prefix="episode-") as tmp:
         workdir = Path(tmp) / "repo"
         shutil.copytree(repo, workdir)
+
+        # tests only exist after the task's test patch (§2.6)
+        if task.get("test_patch"):
+            try:
+                apply_patch_to_tree(str(task["test_patch"]), workdir)
+            except PatchError as exc:
+                record["error"] = f"task test patch does not apply: {exc}"
+                record["reason"] = record["error"]
+                return record
+
+        project = task_project(task)
+        if project:
+            try:
+                prepare_checkout(project, workdir)
+            except Exception as exc:  # noqa: BLE001
+                record["error"] = f"checkout prep failed: {type(exc).__name__}: {exc}"
+                record["reason"] = record["error"]
+                return record
+
         sandbox = Sandbox(workdir, limits=limits)
-        env = ToolEnv(sandbox=sandbox)
+        env = ToolEnv(
+            sandbox=sandbox,
+            test_base=base,
+            test_targets=targets,
+            test_pythonpath=pythonpath_for(workdir),
+        )
         tools = build_toolset(env)
         started = time.monotonic()
         episode = run_episode(

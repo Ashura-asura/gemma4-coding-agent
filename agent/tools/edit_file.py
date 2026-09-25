@@ -80,6 +80,66 @@ def _diff_targets(diff: str) -> list[str]:
     return targets
 
 
+class PatchError(Exception):
+    """A patch could not be applied to a file tree."""
+
+
+def split_multifile_patch(patch: str) -> dict[str, str]:
+    """Split a multi-file unified diff into ``{path: diff}`` sections."""
+    lines = patch.replace("\r\n", "\n").split("\n")
+    sections: list[tuple[str | None, list[str]]] = []
+    current: list[str] = []
+    target: str | None = None
+    for line in lines:
+        if line.startswith("--- "):
+            if current:
+                sections.append((target, current))
+            current, target = [line], None
+            continue
+        if not current:
+            if line.strip():
+                current = [line]  # "diff --git ..." preamble
+            continue
+        current.append(line)
+        if target is None and line.startswith("+++ "):
+            match = re.match(r"\+\+\+ (?:[ab]/)?(\S+)", line)
+            if match and match.group(1) != "/dev/null":
+                target = match.group(1)
+    if current:
+        sections.append((target, current))
+    return {path: "\n".join(body) for path, body in sections if path}
+
+
+def apply_patch_to_tree(patch: str, root: Path) -> list[str]:
+    """Apply every section of ``patch`` under ``root``; returns changed paths.
+
+    Paths are scope-checked against ``root`` (symlinks/`..` included), and a
+    hunk that does not match raises :class:`PatchError` — all-or-nothing per
+    file, never a half-applied patch.
+    """
+    sections = split_multifile_patch(patch)
+    if not sections:
+        raise PatchError("patch contains no file sections")
+    applied: list[str] = []
+    root_resolved = root.resolve()
+    for rel, diff in sections.items():
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise PatchError(f"patch path escapes the repository: {rel}")
+        target = (root / rel_path).resolve()
+        if target != root_resolved and root_resolved not in target.parents:
+            raise PatchError(f"patch path escapes the repository: {rel}")
+        original = target.read_text(encoding="utf-8") if target.exists() else ""
+        try:
+            updated = apply_unified_diff(original, diff)
+        except ToolError as exc:
+            raise PatchError(f"{rel}: {exc}") from exc
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(updated, encoding="utf-8", newline="")
+        applied.append(rel)
+    return applied
+
+
 def apply_unified_diff(text: str, diff: str) -> str:
     """Apply ``diff`` to ``text`` or raise ToolError. Atomic: all-or-nothing."""
     hunks = _parse_hunks(diff)

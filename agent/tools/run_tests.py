@@ -40,15 +40,17 @@ class RunTests(BaseTool):
         self.command = DEFAULT_TEST_COMMAND
 
     def run(self, target: str | None = None) -> str:
-        argv = list(self.command)
-        if target is not None and target.strip():
-            argv.append(self._scope_checked_target(target.strip()))
-        elif target is not None and not target.strip():
+        argv = self._build_argv(target)
+        if target is not None and not target.strip():
             raise ToolError("target must not be empty")
 
         started = time.monotonic()
         try:
-            result = self.env.sandbox.run(argv, timeout=TEST_TIMEOUT_S)
+            result = self.env.sandbox.run(
+                argv,
+                timeout=TEST_TIMEOUT_S,
+                pythonpath=self.env.test_pythonpath,
+            )
         except SandboxError as exc:  # pragma: no cover - run() returns errors instead
             raise ToolError(str(exc)) from exc
         duration = time.monotonic() - started
@@ -68,6 +70,16 @@ class RunTests(BaseTool):
             lines.append("")
             lines.append(body)
         return "\n".join(lines)
+
+    def _build_argv(self, target: str | None) -> list[str]:
+        """Task-configured suite when present, otherwise the default pytest run."""
+        if target is not None and target.strip():
+            return list(self.env.test_base or self.command) + [
+                self._scope_checked_target(target.strip())
+            ]
+        if self.env.test_base is not None:
+            return list(self.env.test_base) + list(self.env.test_targets or [])
+        return list(self.command)
 
     def _scope_checked_target(self, target: str) -> str:
         """A target must not point outside the repository root."""
