@@ -3,11 +3,15 @@
 Designed for a Kaggle free-tier T4/P100 session (§5): 4-bit base + LoRA,
 completion-only loss, frequent resumable checkpoints. Entry point:
 ``python -m train.sft.trainer --config configs/sft_config.yaml``.
+
+Gemma-4 specifics (verified against the model cards): the ``-it`` checkpoints
+ship ``chat_template.jinja`` (base does not), the chat template lives on
+``AutoProcessor`` (not a bare tokenizer), and the unified arch may register
+under any of three auto classes.
 """
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 import sys
@@ -16,20 +20,24 @@ from typing import Any
 
 import yaml
 
+KAGGLE_SLUG = "google/gemma-4/transformers/gemma-4-12b-it"
+HF_SLUG = "google/gemma-4-12B-it"
+MODEL_CLASSES = ("AutoModelForCausalLM", "AutoModelForImageTextToText", "AutoModelForMultimodalLM")
+
 
 def _is_kaggle() -> bool:
     return bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE")) or Path("/kaggle/input").exists()
 
 
 def resolve_base_model(config: dict[str, Any]) -> str:
-    """Config value > Kaggle model download > HF hub default (§0.3: 12B primary)."""
+    """Config value > Kaggle model download > HF hub (§0.3: 12B-it primary)."""
     if config.get("base_model"):
         return str(config["base_model"])
     if _is_kaggle():
         import kagglehub
 
-        return kagglehub.model_download("google/gemma-4/transformers/gemma-4-12b")
-    return "google/gemma-4-12B"
+        return kagglehub.model_download(KAGGLE_SLUG)
+    return HF_SLUG
 
 
 def _dtype(name: str, torch: Any) -> Any:
@@ -41,50 +49,58 @@ def _dtype(name: str, torch: Any) -> Any:
     return wanted
 
 
-def load_model_and_tokenizer(base: str, config: dict[str, Any]):
-    """4-bit base + tokenizer; falls back to the multimodal auto class (§0.3)."""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+def _load_first_model(base: str, config: dict[str, Any], torch: Any) -> Any:
+    """Try the auto classes until one accepts Gemma-4's unified arch."""
+    from transformers import BitsAndBytesConfig
 
     bits = int(config.get("quantization", {}).get("bits", 4))
-    quantization_config = None
-    if bits == 4 and torch.cuda.is_available():
-        from transformers import BitsAndBytesConfig
-
-        quantization_config = BitsAndBytesConfig(
+    compute_dtype = _dtype(str(config.get("quantization", {}).get("compute_dtype", "bfloat16")), torch)
+    kwargs: dict[str, Any] = {"device_map": "auto", "torch_dtype": "auto"}
+    if bits == 4:
+        kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=_dtype(str(config.get("quantization", {}).get("compute_dtype", "bfloat16")), torch),
+            bnb_4bit_compute_dtype=compute_dtype,
         )
+    else:
+        kwargs["torch_dtype"] = compute_dtype
 
-    model = _load_auto_model(
-        AutoModelForCausalLM,
-        base,
-        quantization_config=quantization_config,
-        device_map="auto" if torch.cuda.is_available() else None,
-        torch_dtype=_dtype(str(config.get("quantization", {}).get("compute_dtype", "bfloat16")), torch)
-        if bits != 4
-        else "auto",
-    )
-    tokenizer = AutoTokenizer.from_pretrained(base)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer
+    import transformers
 
-
-def _load_auto_model(primary_cls: Any, base: str, **kwargs: Any) -> Any:
-    try:
-        return primary_cls.from_pretrained(base, **kwargs)
-    except (ValueError, KeyError, ImportError) as exc:
-        # Gemma-4's unified arch may only register the multimodal causal class
-        from transformers import AutoModelForMultimodalLM
-
-        print(f"[sft] {primary_cls.__name__} refused ({exc}); trying AutoModelForMultimodalLM", flush=True)
-        return AutoModelForMultimodalLM.from_pretrained(base, **kwargs)
+    errors: list[str] = []
+    for name in MODEL_CLASSES:
+        cls = getattr(transformers, name, None)
+        if cls is None:
+            continue
+        try:
+            model = cls.from_pretrained(base, **kwargs)
+            print(f"[sft] loaded with {name}", flush=True)
+            return model
+        except Exception as exc:  # arch registration differs across cards/versions
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    raise SystemExit("[sft] no auto model class accepted the checkpoint:\n  " + "\n  ".join(errors))
 
 
-def build_dataset(path: str, tokenizer: Any, config: dict[str, Any]):
+def load_model_and_processor(base: str, config: dict[str, Any]):
+    """4-bit base + processor (Gemma-4's chat template lives on the processor)."""
+    import torch
+    from transformers import AutoProcessor
+
+    model = _load_first_model(base, config, torch)
+    processor = AutoProcessor.from_pretrained(base)
+    inner = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if not getattr(inner, "chat_template", None) and not getattr(processor, "chat_template", None):
+        raise SystemExit(
+            f"[sft] {base} has no chat template — only -it checkpoints ship "
+            f"chat_template.jinja; set config base_model accordingly"
+        )
+    if inner.pad_token_id is None and inner.eos_token_id is not None:
+        inner.pad_token = inner.eos_token
+    return model, processor
+
+
+def build_dataset(path: str, processor: Any, config: dict[str, Any]):
     """jsonl trajectories -> pre-tokenized dataset with completion-only labels."""
     from datasets import Dataset
 
@@ -97,7 +113,7 @@ def build_dataset(path: str, tokenizer: Any, config: dict[str, Any]):
     max_seq_len = int(config["training"]["max_seq_len"])
 
     def _encode(record: dict[str, Any]) -> dict[str, list[int]]:
-        return encode_trajectory(tokenizer, record["messages"], max_seq_len)
+        return encode_trajectory(processor, record["messages"], max_seq_len)
 
     dataset = Dataset.from_list([{"messages": record["messages"]} for record in records])
     return dataset.map(
@@ -150,26 +166,19 @@ def last_checkpoint(output_dir: str) -> str | None:
     return str(checkpoints[-1]) if checkpoints else None
 
 
-def train(config_path: str, *, resume: str | None, base_override: str | None, dry_run: bool) -> None:
+def train(config_path: str, *, resume: str | None, base_override: str | None) -> None:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise SystemExit("[sft] training needs a GPU (ARCHITECTURE §5) — use --dry-run for a CPU check")
+
     config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
     base = base_override or resolve_base_model(config)
     print(f"[sft] base model: {base}", flush=True)
 
-    model, tokenizer = load_model_and_tokenizer(base, config)
-    dataset = build_dataset(config["data"]["path"], tokenizer, config)
+    model, processor = load_model_and_processor(base, config)
+    dataset = build_dataset(config["data"]["path"], processor, config)
 
-    if dry_run:
-        sample = dataset[0]
-        trainable = sum(1 for label in sample["labels"] if label != -100)
-        print(
-            f"[sft] dry-run OK: {len(dataset)} trajectories, "
-            f"sample tokens={len(sample['input_ids'])}, trained={trainable} "
-            f"({trainable / max(1, len(sample['labels'])):.0%} unmasked)",
-            flush=True,
-        )
-        return
-
-    import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
     from train.sft.data_collator import TrajectoryCollator
@@ -203,7 +212,7 @@ def train(config_path: str, *, resume: str | None, base_override: str | None, dr
         model=model,
         args=training_arguments(config, torch),
         train_dataset=dataset,
-        data_collator=TrajectoryCollator(tokenizer),
+        data_collator=TrajectoryCollator(processor),
     )
     try:
         trainer.train(resume_from_checkpoint=resume_from)
@@ -222,7 +231,7 @@ def train(config_path: str, *, resume: str | None, base_override: str | None, dr
         raise SystemExit(3)
 
     trainer.save_model(config["output_dir"])
-    tokenizer.save_pretrained(config["output_dir"])
+    processor.save_pretrained(config["output_dir"])
     print(f"[sft] adapter saved to {config['output_dir']}", flush=True)
 
 
@@ -242,14 +251,18 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    if args.dry_run:
-        config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-        from transformers import AutoTokenizer
+    config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    base = args.base_model or resolve_base_model(config)
 
-        tokenizer = AutoTokenizer.from_pretrained(resolve_base_model(config))
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        dataset = build_dataset(config["data"]["path"], tokenizer, config)
+    if args.dry_run:
+        from transformers import AutoProcessor
+
+        print(f"[sft] dry-run base: {base}", flush=True)
+        processor = AutoProcessor.from_pretrained(base)
+        inner = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        if inner.pad_token_id is None and inner.eos_token_id is not None:
+            inner.pad_token = inner.eos_token
+        dataset = build_dataset(config["data"]["path"], processor, config)
         sample = dataset[0]
         trained = sum(1 for label in sample["labels"] if label != -100)
         print(
@@ -260,7 +273,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    train(args.config, resume=args.resume, base_override=args.base_model, dry_run=False)
+    train(args.config, resume=args.resume, base_override=args.base_model)
 
 
 if __name__ == "__main__":

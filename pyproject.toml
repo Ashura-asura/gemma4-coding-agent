@@ -18,6 +18,7 @@ dev = [
 ]
 train = [
     "torch",
+    "torchvision",
     "transformers",
     "peft",
     "trl",

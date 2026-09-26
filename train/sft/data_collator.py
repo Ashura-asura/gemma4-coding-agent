@@ -5,12 +5,50 @@ System/user prompts and tool observations are masked with -100.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Sequence
 
 import torch
 
 
-def _prefix_lengths(tokenizer: Any, messages: Sequence[dict[str, Any]]) -> list[int]:
+def deserialize_tool_args(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gemma-4's template validates ``arguments`` as a JSON object (intentional
+    per the merged model-card fix); our OpenAI-style records store strings."""
+    rendered: list[dict[str, Any]] = []
+    for message in messages:
+        message = dict(message)
+        calls = message.get("tool_calls")
+        if calls:
+            converted = []
+            for call in calls:
+                call = dict(call)
+                function = dict(call.get("function") or {})
+                args = function.get("arguments")
+                if isinstance(args, str):
+                    function["arguments"] = json.loads(args)
+                call["function"] = function
+                converted.append(call)
+            message["tool_calls"] = converted
+        rendered.append(message)
+    return rendered
+
+
+def as_ids(rendered: Any) -> list[int]:
+    """Normalize apply_chat_template(tokenize=True) output to a flat id list.
+
+    Tokenizers return ``list[int]``; Gemma-4's processor returns a batched
+    ``list[list[int]]`` (or a mapping).
+    """
+    if isinstance(rendered, dict):
+        rendered = rendered["input_ids"]
+    if rendered and isinstance(rendered[0], (list, tuple)):
+        rendered = rendered[0]
+    if rendered and isinstance(rendered[0], (list, tuple)):
+        rendered = rendered[0]
+    return list(rendered)
+
+
+def _prefix_lengths(template_owner: Any, messages: Sequence[dict[str, Any]]) -> list[int]:
     """Token count of each message prefix under the chat template.
 
     Turn-based templates (Gemma/Qwen) render prefixes concatenatively, so
@@ -19,30 +57,37 @@ def _prefix_lengths(tokenizer: Any, messages: Sequence[dict[str, Any]]) -> list[
     """
     lengths: list[int] = []
     for index in range(1, len(messages) + 1):
-        rendered = tokenizer.apply_chat_template(
+        rendered = template_owner.apply_chat_template(
             list(messages[:index]), tokenize=True, add_generation_prompt=False
         )
-        lengths.append(len(rendered))
+        lengths.append(len(as_ids(rendered)))
     return lengths
 
 
 def encode_trajectory(
-    tokenizer: Any,
+    template_owner: Any,
     messages: Sequence[dict[str, Any]],
     max_seq_len: int,
 ) -> dict[str, list[int]]:
-    """Render one trajectory to ``input_ids``/``labels`` with assistant-only loss."""
+    """Render one trajectory to ``input_ids``/``labels`` with assistant-only loss.
+
+    ``template_owner`` is a processor (Gemma-4) or tokenizer exposing
+    ``apply_chat_template``.
+    """
     if not messages:
         raise ValueError("trajectory has no messages")
-    input_ids = tokenizer.apply_chat_template(
-        list(messages), tokenize=True, add_generation_prompt=False
+    messages = deserialize_tool_args(messages)
+    input_ids = as_ids(
+        template_owner.apply_chat_template(
+            list(messages), tokenize=True, add_generation_prompt=False
+        )
     )
     if not input_ids:
         raise ValueError("chat template produced no tokens")
 
     labels = [-100] * len(input_ids)
     start = 0
-    for message, end in zip(messages, _prefix_lengths(tokenizer, messages)):
+    for message, end in zip(messages, _prefix_lengths(template_owner, messages)):
         # clamp: non-concatenative templates can misalign, never go backwards
         end = max(start, min(end, len(input_ids)))
         if message.get("role") == "assistant":
@@ -66,9 +111,15 @@ def encode_trajectory(
 
 
 class TrajectoryCollator:
-    """Pad a pre-tokenized batch (labels pad with -100, ids with eos)."""
+    """Pad a pre-tokenized batch (labels pad with -100, ids with eos).
+
+    ``tokenizer`` may be a processor — Gemma-4 is multimodal and exposes the
+    chat template on ``AutoProcessor``, with the tokenizer underneath.
+    """
 
     def __init__(self, tokenizer: Any, pad_to_multiple_of: int | None = 8) -> None:
+        if hasattr(tokenizer, "tokenizer"):
+            tokenizer = tokenizer.tokenizer
         self.pad_token_id = tokenizer.pad_token_id
         if self.pad_token_id is None:
             self.pad_token_id = tokenizer.eos_token_id
