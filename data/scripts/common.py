@@ -32,10 +32,12 @@ from typing import Any, Iterable, Iterator
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
-MIRROR_DIR = RAW_DIR / "mirrors"
-WORK_DIR = DATA_DIR / "work"
+# heavy directories can be relocated (e.g. WSL/ext4) while pool + outputs
+# stay on the shared tree — overrides are plain env vars
+MIRROR_DIR = Path(os.environ.get("SWE_MIRROR_DIR") or RAW_DIR / "mirrors")
+WORK_DIR = Path(os.environ.get("SWE_WORK_DIR") or DATA_DIR / "work")
 CHECKOUT_DIR = WORK_DIR / "checkouts"
-VENV_DIR = DATA_DIR / "venvs"
+VENV_DIR = Path(os.environ.get("SWE_VENV_DIR") or DATA_DIR / "venvs")
 POOL_PATH = RAW_DIR / "verified_pool.jsonl"
 SFT_PATH = DATA_DIR / "sft_trajectories.jsonl"
 RL_PATH = DATA_DIR / "rl_task_pool.jsonl"
