@@ -78,7 +78,11 @@ REPO_SETUP: dict[str, dict[str, Any]] = {
     },
     "pytest-dev/pytest": {
         # setuptools-scm writes src/_pytest/_version.py during the -e build
-        "deps": ["iniconfig", "packaging", "pluggy", "exceptiongroup", "tomli", "attrs", "py", "setuptools-scm", "toml"],
+        # six / more-itertools / importlib-metadata / atomicwrites: imported
+        # by the old checkouts (4.x-5.x era, Windows) but no longer installed
+        "deps": ["iniconfig", "packaging", "pluggy", "exceptiongroup", "tomli", "attrs", "py",
+                 "setuptools-scm", "toml", "six", "more-itertools", "importlib-metadata",
+                 "atomicwrites"],
         "runner": "pytest",
         "editable": True,  # src/ layout: the checkout must be importable
     },
