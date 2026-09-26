@@ -1014,7 +1014,7 @@ def replay_trajectory(record: dict[str, Any], *, limits: Any = None, timeout: fl
     shutil.rmtree(workdir.parent, ignore_errors=True)
     try:
         checkout(record["repo_url"], record["base_commit"], workdir)
-        python = ensure_venv(record["repo"])
+        python = ensure_venv_by_slug(record.get("venv") or slugify(record["repo"]))
         prepare_checkout(record["repo"], workdir)
     except Exception:
         shutil.rmtree(workdir.parent, ignore_errors=True)
