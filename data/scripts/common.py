@@ -53,7 +53,7 @@ REPO_SETUP: dict[str, dict[str, Any]] = {
         "deps": ["asgiref", "sqlparse", "pytz"],
         "runner": "django",
         "editable": False,
-        "shims": ["gettext_codeset"],
+        "shims": ["gettext_codeset", "collections_abc"],
     },
     "sympy/sympy": {"deps": ["mpmath"], "runner": "pytest-k", "editable": False,
                     "shims": ["collections_abc"]},
@@ -72,6 +72,7 @@ REPO_SETUP: dict[str, dict[str, Any]] = {
         ],
         "runner": "pytest",
         "editable": False,
+        "shims": ["types_union"],
     },
     "pytest-dev/pytest": {
         # setuptools-scm writes src/_pytest/_version.py during the -e build
@@ -86,6 +87,7 @@ REPO_SETUP: dict[str, dict[str, Any]] = {
         # 2.13.7 is the last 2.x with python 3.11 support
         "deps": ["astroid==2.13.5", "isort", "toml", "tomlkit", "dill", "mccabe",
                  "platformdirs", "appdirs", "pytest==7.4.4"],
+        "shims": ["collections_abc"],
         "runner": "pytest",
         "editable": False,
     },
@@ -149,6 +151,15 @@ for _name in ("Mapping", "MutableMapping", "Callable", "Iterable", "Iterator",
               "Sequence", "MutableSequence", "Set", "MutableSet", "Hashable"):
     if not hasattr(_collections, _name):
         setattr(_collections, _name, getattr(_collections_abc, _name))
+''',
+    "types_union": '''\
+import types as _types
+
+# Sphinx 4.1-4.3 guarded ``from types import Union`` behind sys.version_info
+# > (3, 10) — a name that never shipped. Alias the real PEP 604 type.
+if not hasattr(_types, "Union"):
+    _types.Union = getattr(_types, "UnionType", None) or __import__(
+        "typing", fromlist=["Union"]).Union
 ''',
 }
 
