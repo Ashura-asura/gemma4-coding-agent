@@ -24,6 +24,7 @@ train = [
     "datasets",
     "accelerate",
     "bitsandbytes",
+    "kagglehub",
 ]
 
 [tool.setuptools]
@@ -40,5 +41,5 @@ packages = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["sandbox/tests", "agent/tests", "eval/tests", "data/tests"]
+testpaths = ["sandbox/tests", "agent/tests", "eval/tests", "data/tests", "train/tests"]
 addopts = "-q"
