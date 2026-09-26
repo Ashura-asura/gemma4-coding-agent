@@ -90,8 +90,12 @@ def split_multifile_patch(patch: str) -> dict[str, str]:
     sections: list[tuple[str | None, list[str]]] = []
     current: list[str] = []
     target: str | None = None
-    for line in lines:
-        if line.startswith("--- "):
+    for index, line in enumerate(lines):
+        # `--- ` only heads a section when a `+++ ` line follows it;
+        # inside a hunk the same text can be removed-content
+        if line.startswith("--- ") and (
+            not current or (index + 1 < len(lines) and lines[index + 1].startswith("+++ "))
+        ):
             if current:
                 sections.append((target, current))
             current, target = [line], None
@@ -140,6 +144,43 @@ def apply_patch_to_tree(patch: str, root: Path) -> list[str]:
     return applied
 
 
+def _hunk_source_lines(hunk: Any) -> list[str]:
+    return [content for tag, content in hunk.body if tag in (" ", "-")]
+
+
+def _locate_hunk(lines: list[str], hunk: Any, expected: int, floor: int) -> int | None:
+    """Where the hunk's context actually sits in ``lines``.
+
+    Like ``git apply``, a hunk may be off by a few lines (SWE-bench gold
+    patches carry offsets): try the recorded position, then the nearest
+    positions whose leading line matches, but never above ``floor`` so
+    hunks keep their order.
+    """
+    if expected >= floor and _hunk_matches(lines, hunk, expected) is not None:
+        return expected
+    source = _hunk_source_lines(hunk)
+    if not source:
+        return min(max(expected, floor), len(lines))
+    first = source[0]
+    candidates = [i for i in range(floor, len(lines)) if lines[i] == first]
+    candidates.sort(key=lambda i: (abs(i - expected), i))
+    for start in candidates:
+        if _hunk_matches(lines, hunk, start) is not None:
+            return start
+    return None
+
+
+def _hunk_matches(lines: list[str], hunk: Any, start: int) -> int | None:
+    """Source lines consumed if the hunk matches at ``start``, else None."""
+    consumed = 0
+    for tag, content in hunk.body:
+        if tag in (" ", "-"):
+            if start + consumed >= len(lines) or lines[start + consumed] != content:
+                return None
+            consumed += 1
+    return consumed
+
+
 def apply_unified_diff(text: str, diff: str) -> str:
     """Apply ``diff`` to ``text`` or raise ToolError. Atomic: all-or-nothing."""
     hunks = _parse_hunks(diff)
@@ -147,22 +188,17 @@ def apply_unified_diff(text: str, diff: str) -> str:
     out: list[str] = []
     pos = 0
     for hunk in hunks:
-        start = hunk.old_start - 1 if hunk.old_start > 0 else 0
-        if start < pos:
-            raise ToolError(f"overlapping hunks near line {hunk.old_start}")
+        expected = hunk.old_start - 1 if hunk.old_start > 0 else 0
+        start = _locate_hunk(lines, hunk, expected, pos)
+        if start is None:
+            raise ToolError(
+                f"patch does not apply: no context for hunk @@ -{hunk.old_start} "
+                f"found at or after line {pos + 1}"
+            )
         out.extend(lines[pos:start])
         pos = start
         for tag, content in hunk.body:
             if tag in (" ", "-"):
-                if pos >= len(lines):
-                    raise ToolError(
-                        f"patch does not apply: expected {content!r} at line {pos + 1}, got <EOF>"
-                    )
-                if lines[pos] != content:
-                    raise ToolError(
-                        f"patch does not apply at line {pos + 1}: "
-                        f"expected {content!r}, found {lines[pos]!r}"
-                    )
                 if tag == " ":
                     out.append(content)
                 pos += 1

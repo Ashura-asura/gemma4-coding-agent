@@ -119,6 +119,14 @@ REPO_SETUP: dict[str, dict[str, Any]] = {
     },
 }
 
+#: sphinx >= 5's ``addnodes`` imports ``docutils.nodes.meta`` (added in
+#: docutils 0.18) while sphinx < 5 breaks on docutils >= 0.18 — one venv
+#: per docutils era, selected from the instance's sphinx version.
+SPHINX_DOCUTILS_TIERS: dict[str, str] = {
+    "d18": "docutils==0.18.1",  # sphinx 5.x
+    "d19": "docutils==0.19",  # sphinx 6.x+
+}
+
 #: ``sitecustomize.py`` bodies installed into a repo venv. They restore
 #: APIs the *code under test* was written against but modern Python dropped
 #: (``codeset``, ``collections.Mapping``) — plain environment setup: every
@@ -337,7 +345,13 @@ def checkout(repo_url: str, commit: str, dest: str | Path) -> Path:
     dest.mkdir(parents=True, exist_ok=True)
     mirror = ensure_mirror(repo_url)
     try:
-        result = _run(["git", "--git-dir", str(mirror), "archive", "--format=tar", commit], timeout=300)
+        # core.autocrlf (true on this machine) otherwise makes `git archive`
+        # emit CRLF trees; SWE-bench patches are generated against LF blobs
+        result = _run(
+            ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+             "--git-dir", str(mirror), "archive", "--format=tar", commit],
+            timeout=300,
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"git archive {commit[:10]} failed: {result.stderr.decode(errors='replace')[:300]}"
@@ -400,10 +414,21 @@ def _write_shims(slug: str, setup: dict[str, Any]) -> None:
     os.replace(tmp, site / "sitecustomize.py")
 
 
-def ensure_venv(repo: str) -> Path:
-    """Create (once) and populate the venv for ``repo``. Returns its python."""
+def ensure_venv(repo: str, *, tier: str | None = None) -> Path:
+    """Create (once) and populate the venv for ``repo``. Returns its python.
+
+    ``tier`` selects an alternate dependency pin within the repo (see
+    :data:`SPHINX_DOCUTILS_TIERS`); tiers get their own directory + marker.
+    """
     setup = REPO_SETUP.get(repo, {"deps": []})
-    slug = slugify(repo)
+    deps = list(setup.get("deps", []))
+    shims = list(setup.get("shims") or [])
+    suffix = ""
+    if tier:
+        suffix = f"-{tier}"
+        deps = [d for d in deps if not d.startswith("docutils")]
+        deps.append(SPHINX_DOCUTILS_TIERS[tier])
+    slug = slugify(repo) + suffix
     py = venv_python(slug)
     if not py.exists():
         VENV_DIR.mkdir(parents=True, exist_ok=True)
@@ -412,20 +437,50 @@ def ensure_venv(repo: str) -> Path:
             raise RuntimeError(f"venv creation failed for {repo}: {result.stderr.decode(errors='replace')[:400]}")
     marker = VENV_DIR / f"{slug}.deps.ok"
     if not marker.exists():
-        deps = ["pytest", "setuptools", "wheel", *setup.get("deps", [])]
+        # tzdata: Windows has no system IANA zone database for zoneinfo
+        deps = ["pytest", "setuptools", "wheel", "tzdata", *deps]
         result = _run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *deps], timeout=1800)
         if result.returncode != 0:
             raise RuntimeError(f"pip install failed for {repo}: {result.stderr.decode(errors='replace')[-600:]}")
         marker.write_text("ok", encoding="utf-8")
-    _write_shims(slug, setup)
+    _write_shims(slug, {**setup, "shims": shims})
     return py
+
+
+def sphinx_tier_for(version: Any) -> str | None:
+    """Docutils-era tier for a sphinx instance version, or None for default."""
+    match = re.match(r"(\d+(?:\.\d+)?)", str(version or ""))
+    if not match:
+        return None
+    value = float(match.group(1))
+    if value >= 6:
+        return "d19"
+    if value >= 5:
+        return "d18"
+    return None
+
+
+def ensure_venv_for_instance(instance: dict[str, Any]) -> tuple[str, Path]:
+    """``(venv_slug, python)`` matched to this instance's era, if any."""
+    repo = instance["repo"]
+    if repo == "sphinx-doc/sphinx":
+        tier = sphinx_tier_for(instance.get("version"))
+        if tier:
+            slug = slugify(repo) + f"-{tier}"
+            return slug, ensure_venv(repo, tier=tier)
+    return slugify(repo), ensure_venv(repo)
 
 
 def ensure_venv_by_slug(slug: str) -> Path:
     """Ensure the venv a *task record* refers to (``venv`` field) exists."""
-    for repo, setup in REPO_SETUP.items():
-        if slugify(repo) == slug:
+    for repo in REPO_SETUP:
+        base = slugify(repo)
+        if base == slug:
             return ensure_venv(repo)
+        if repo == "sphinx-doc/sphinx" and slug.startswith(base + "-d"):
+            tier = slug[len(base) + 1:]
+            if tier in SPHINX_DOCUTILS_TIERS:
+                return ensure_venv(repo, tier=tier)
     py = venv_python(slug)
     if not py.exists():
         VENV_DIR.mkdir(parents=True, exist_ok=True)
@@ -663,7 +718,8 @@ def verify_instance(
 
     try:
         checkout(instance["repo_url"], instance["base_commit"], workdir)
-        python = ensure_venv(repo)
+        venv_slug, python = ensure_venv_for_instance(instance)
+        outcome["venv"] = venv_slug
         prepare_checkout(repo, workdir)
         specs = [s for s in test_specs(instance, python=python) if s["targets"]]
     except Exception as exc:
@@ -795,8 +851,8 @@ def verified_record(instance: dict[str, Any], evidence: dict[str, Any]) -> dict[
         "gold_patch": instance["gold_patch"],
         "test_runner": evidence["test_runner"],
         "test_target": evidence["test_target"],
-        "test_k_expr": evidence["test_k_expr"],
-        "venv": slugify(instance["repo"]),
+        "test_k_expr": evidence.get("test_k_expr"),
+        "venv": evidence.get("venv") or slugify(instance["repo"]),
         "source": instance.get("source", "SWE-bench"),
         "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "verify": {
@@ -812,6 +868,10 @@ def ensure_venvs(repos: Iterable[str]) -> None:
     for repo in sorted(set(repos)):
         _say(f"[venv] {repo} ...", flush=True)
         ensure_venv(repo)
+        if repo == "sphinx-doc/sphinx":
+            for tier in SPHINX_DOCUTILS_TIERS:
+                _say(f"[venv] {repo} ({tier}) ...", flush=True)
+                ensure_venv(repo, tier=tier)
 
 
 def _verify_shard(payload: tuple[list[dict[str, Any]], float, bool]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
