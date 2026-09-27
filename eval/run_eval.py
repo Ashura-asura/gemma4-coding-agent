@@ -319,12 +319,26 @@ class HFPolicy:
 
     def __init__(
         self,
-        model_path: str,
+        model_path: str | None = None,
         *,
         max_new_tokens: int = 768,
         temperature: float = 0.2,
         quantize: bool = False,
+        preloaded: tuple[Any, Any] | None = None,
     ) -> None:
+        if preloaded is not None:
+            # GRPO shares its trainable model with rollouts instead of
+            # loading a second copy (§5: one 12B resident at a time)
+            import torch
+
+            self._torch = torch
+            self.model, self.tokenizer = preloaded
+            self.max_new_tokens = max_new_tokens
+            self.temperature = temperature
+            self._quantized = False
+            return
+        if model_path is None:
+            raise ValueError("HFPolicy needs model_path or preloaded")
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -365,9 +379,14 @@ class HFPolicy:
         self.temperature = temperature
 
     def generate_tool_call(self, context) -> ToolCall:  # type: ignore[no-untyped-def]
+        from train.sft.data_collator import deserialize_tool_args
+
+        # Gemma-4's template validates tool arguments as JSON objects; our
+        # messages carry them as strings (same as the stored trajectories)
+        messages = deserialize_tool_args(context.messages)
         if getattr(self.tokenizer, "chat_template", None):
             prompt = self.tokenizer.apply_chat_template(
-                context.messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True
             )
         else:
             prompt = context.render_flat()

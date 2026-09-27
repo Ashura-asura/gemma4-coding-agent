@@ -6,6 +6,7 @@ System/user prompts and tool observations are masked with -100.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any, Sequence
 
 import torch
@@ -36,10 +37,11 @@ def deserialize_tool_args(messages: Sequence[dict[str, Any]]) -> list[dict[str, 
 def as_ids(rendered: Any) -> list[int]:
     """Normalize apply_chat_template(tokenize=True) output to a flat id list.
 
-    Tokenizers return ``list[int]``; Gemma-4's processor returns a batched
-    ``list[list[int]]`` (or a mapping).
+    Tokenizers return ``list[int]`` (sometimes wrapped in a ``BatchEncoding``,
+    which is a UserDict — not a dict); Gemma-4's processor returns a batched
+    ``list[list[int]]``.
     """
-    if isinstance(rendered, dict):
+    if isinstance(rendered, Mapping):
         rendered = rendered["input_ids"]
     if rendered and isinstance(rendered[0], (list, tuple)):
         rendered = rendered[0]

@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from train.sft.data_collator import TrajectoryCollator, encode_trajectory
+from train.sft.data_collator import TrajectoryCollator, as_ids, encode_trajectory
 
 
 class FakeTokenizer:
@@ -86,3 +86,16 @@ def test_collator_padding_shapes():
     padded_from = len(encode_trajectory(tok, MESSAGES[:2], max_seq_len=4096)["input_ids"])
     assert (batch["labels"][short, padded_from:] == -100).all()
     assert (batch["attention_mask"][short, padded_from:] == 0).all()
+
+
+def test_as_ids_handles_batch_encoding_userdict():
+    # bare AutoTokenizer wraps tokenize=True output in BatchEncoding (UserDict,
+    # NOT a dict) — must unwrap ["input_ids"] instead of iterating the keys
+    from transformers import BatchEncoding
+
+    be = BatchEncoding({"input_ids": [7, 8, 9], "attention_mask": [1, 1, 1]})
+    assert not isinstance(be, dict)
+    assert as_ids(be) == [7, 8, 9]
+    # processor-style batched nested list still unwraps
+    assert as_ids([[4, 5], [6]]) == [4, 5]
+    assert as_ids([4, 5, 6]) == [4, 5, 6]
