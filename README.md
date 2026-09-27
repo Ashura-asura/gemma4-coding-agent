@@ -23,6 +23,12 @@ Rung 0 (`ARCHITECTURE.md` §8.1) still needs the base/instruct model on the
 Kaggle GPU host — nothing is trusted as a reward signal until the sandbox
 suite and a baseline eval have been run there, not just on this Windows box.
 
+Kaggle notebooks (private kernels, `kaggle/` is the source of truth):
+SFT → <https://www.kaggle.com/code/ashuraasura/gemma-4-qlora-sft-architecture-2-4>,
+GRPO → <https://www.kaggle.com/code/ashuraasura/gemma-4-grpo-rl>.
+Both need the `GH_TOKEN` secret; the GRPO kernel additionally needs the
+SFT adapter uploaded as a Dataset input.
+
 ## Layout
 
 See `ARCHITECTURE.md` §4. Short version: `sandbox/` (executor + adversarial
