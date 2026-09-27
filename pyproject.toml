@@ -42,5 +42,5 @@ packages = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["sandbox/tests", "agent/tests", "eval/tests", "data/tests", "train/tests"]
+testpaths = ["sandbox/tests", "agent/tests", "eval/tests", "data/tests", "train/tests", "train/rl/tests"]
 addopts = "-q"
