@@ -317,7 +317,14 @@ def parse_tool_call(text: str) -> ToolCall:
 class HFPolicy:
     """Zero-shot (Rung 0) or adapter-loaded (Rungs 1-3) transformers policy."""
 
-    def __init__(self, model_path: str, *, max_new_tokens: int = 768, temperature: float = 0.2) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        max_new_tokens: int = 768,
+        temperature: float = 0.2,
+        quantize: bool = False,
+    ) -> None:
         try:
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -329,8 +336,29 @@ class HFPolicy:
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
-        if torch.cuda.is_available():
+        kwargs: dict[str, Any] = {"torch_dtype": dtype}
+        self._quantized = bool(quantize and torch.cuda.is_available())
+        if self._quantized:
+            from transformers import BitsAndBytesConfig
+
+            kwargs = {
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=dtype,
+                ),
+                "device_map": "auto",
+            }
+        is_adapter = (Path(model_path) / "adapter_config.json").exists()
+        if is_adapter:
+            from peft import PeftConfig, PeftModel
+
+            peft_cfg = PeftConfig.from_pretrained(model_path)
+            base = AutoModelForCausalLM.from_pretrained(peft_cfg.base_model_name_or_path, **kwargs)
+            self.model = PeftModel.from_pretrained(base, model_path)
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+        if torch.cuda.is_available() and not self._quantized:
             self.model = self.model.cuda()
         self.model.eval()
         self.max_new_tokens = max_new_tokens
@@ -367,13 +395,18 @@ def build_policy_factory(name: str, args: argparse.Namespace) -> Callable[[dict[
 
         return _null
     if name == "hf":
+        shared: dict[str, Policy] = {}
 
         def _hf(task: dict[str, Any]) -> Policy:
-            return HFPolicy(
-                args.model,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-            )
+            # one load per run: reloading a 12B model per task would dominate
+            if "policy" not in shared:
+                shared["policy"] = HFPolicy(
+                    args.model,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    quantize=bool(getattr(args, "quantize", False)),
+                )
+            return shared["policy"]
 
         return _hf
     raise SystemExit(f"unknown policy: {name}")
@@ -487,6 +520,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--max-new-tokens", type=int, default=768)
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="4-bit load for --policy hf (required to fit 12B on T4/P100, §5)",
+    )
     parser.add_argument("--limit", type=int, help="only run the first N tasks")
     parser.add_argument("--out", default="eval/results/run.jsonl")
     parser.add_argument("--dump-trajectories", help="write full trajectories to this JSONL")

@@ -42,15 +42,21 @@ def episode_reward(
     weights: dict[str, float] | None = None,
     limits: Any = None,
     test_timeout: float | None = None,
+    score: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Score one finished episode against the task's held-out tests."""
+    """Score one finished episode against the task's held-out tests.
+
+    ``score`` passes through a precomputed ``score_submission`` result (the
+    eval/rollout path already ran the tests — don't run them twice).
+    """
     w = {**DEFAULT_WEIGHTS, **(weights or {})}
-    kwargs: dict[str, Any] = {}
-    if limits is not None:
-        kwargs["limits"] = limits
-    if test_timeout is not None:
-        kwargs["test_timeout"] = test_timeout
-    score = score_submission(task, patch, **kwargs)
+    if score is None:
+        kwargs: dict[str, Any] = {}
+        if limits is not None:
+            kwargs["limits"] = limits
+        if test_timeout is not None:
+            kwargs["test_timeout"] = test_timeout
+        score = score_submission(task, patch, **kwargs)
 
     test_bonus = w["test_pass"] if score.get("resolved") else 0.0
     validity_bonus = w["patch_validity"] if score.get("patch_valid") else 0.0
