@@ -96,7 +96,9 @@ def load_policy(config: dict[str, Any], *, quantize: bool = True) -> tuple[Any, 
     base = AutoModelForCausalLM.from_pretrained(base_id, **kwargs)
     for parameter in base.parameters():
         parameter.requires_grad = False
-    policy = PeftModel.from_pretrained(base, policy_path, is_trainable=True)
+    # adapter_name matters: every set_adapter("policy")/set_adapter("ref")
+    # below and the resume path address these names explicitly
+    policy = PeftModel.from_pretrained(base, policy_path, adapter_name="policy", is_trainable=True)
     ref_path = str(config.get("frozen_sft_baseline") or policy_path)
     if Path(ref_path).exists() and Path(ref_path).resolve() != Path(policy_path).resolve():
         policy.load_adapter(ref_path, adapter_name="ref")
@@ -287,23 +289,34 @@ def main(argv: list[str] | None = None) -> int:
 
     policy, tokenizer = load_policy(config)
 
+    resume_ckpt: Path | None = None
     if resume in ("auto", "latest"):
-        latest = _last_checkpoint(output_dir)
-        if latest and (latest / "adapter_config.json").exists():
-            from peft import set_peft_model_state_dict
-            from peft.utils import load_peft_weights
+        resume_ckpt = _last_checkpoint(output_dir)
+    elif resume:
+        candidate = Path(str(resume))
+        if candidate.is_dir():
+            resume_ckpt = candidate
 
-            state = load_peft_weights(str(latest))
-            set_peft_model_state_dict(policy, state, adapter_name="policy")
-            state_json = latest / "grpo_state.json"
-            if state_json.exists():
-                start_update = int(json.loads(state_json.read_text(encoding="utf-8")).get("update", 0))
-            print(f"[grpo] resumed from {latest} (update {start_update})", flush=True)
+    if resume_ckpt and (resume_ckpt / "adapter_config.json").exists():
+        from peft import set_peft_model_state_dict
+        from peft.utils import load_peft_weights
+
+        state = load_peft_weights(str(resume_ckpt))
+        set_peft_model_state_dict(policy, state, adapter_name="policy")
+        state_json = resume_ckpt / "grpo_state.json"
+        if state_json.exists():
+            start_update = int(json.loads(state_json.read_text(encoding="utf-8")).get("update", 0))
+        print(f"[grpo] resumed from {resume_ckpt} (update {start_update})", flush=True)
 
     optimizer = torch.optim.AdamW(
         [p for p in policy.parameters() if p.requires_grad],
         lr=float(train_cfg["learning_rate"]),
     )
+    if resume_ckpt and (resume_ckpt / "optimizer.pt").exists():
+        optimizer.load_state_dict(
+            torch.load(resume_ckpt / "optimizer.pt", map_location="cpu", weights_only=True)
+        )
+        print("[grpo] optimizer state restored", flush=True)
 
     def factory(_task: dict[str, Any]) -> Any:
         # rollouts and logprobs share the one resident model (§5)
@@ -359,10 +372,12 @@ def main(argv: list[str] | None = None) -> int:
             max_grad_norm=max_grad_norm,
         )
         rewards = [r for g in groups for r in g["rewards"]]
+        mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
+        best = max(rewards) if rewards else 0.0
         print(
             f"[grpo] update {update}: loss={stats['loss']:.4f} pg={stats['pg']:.4f} "
-            f"kl={stats['kl']:.4f} mean_reward={sum(rewards) / max(1, len(rewards)):.3f} "
-            f"best={max(rewards):.3f} ({time.monotonic() - started:.0f}s)",
+            f"kl={stats['kl']:.4f} mean_reward={mean_reward:.3f} "
+            f"best={best:.3f} ({time.monotonic() - started:.0f}s)",
             flush=True,
         )
 
@@ -370,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             target = output_dir / f"checkpoint-{update + 1}"
             target.mkdir(parents=True, exist_ok=True)
             policy.save_pretrained(target)
+            torch.save(optimizer.state_dict(), target / "optimizer.pt")
             (target / "grpo_state.json").write_text(
                 json.dumps({"update": update + 1}), encoding="utf-8"
             )
