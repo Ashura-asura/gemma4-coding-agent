@@ -975,15 +975,24 @@ def ensure_verified(
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         shards = _shard_candidates(pending, jobs)
-        _say(f"[verify] {total} pending -> {len(shards)} shard(s), {jobs} worker(s)", flush=True)
+        # one future per instance (editable repos stay a single slice): each
+        # result hits the pool as it finishes, so a crash loses only in-flight
+        # work instead of a whole ~60-instance slice held in worker memory
+        units: list[list[dict[str, Any]]] = []
+        for shard in shards:
+            if REPO_SETUP.get(shard[0]["repo"], {}).get("editable"):
+                units.append(shard)
+            else:
+                units.extend([item] for item in shard)
+        _say(f"[verify] {total} pending -> {len(units)} unit(s), {jobs} worker(s)", flush=True)
         finished = 0
         with ProcessPoolExecutor(max_workers=jobs) as pool:
-            futures = [pool.submit(_verify_shard, (shard, timeout, keep)) for shard in shards]
+            futures = [pool.submit(_verify_shard, (unit, timeout, keep)) for unit in units]
             for future in as_completed(futures):
                 try:
                     results = future.result()
-                except Exception as exc:  # noqa: BLE001 - keep the other shards alive
-                    _say(f"  shard failed: {type(exc).__name__}: {exc}", flush=True)
+                except Exception as exc:  # noqa: BLE001 - keep the other units alive
+                    _say(f"  unit failed: {type(exc).__name__}: {exc}", flush=True)
                     continue
                 for instance, evidence in results:
                     finished += 1

@@ -50,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay-limit", type=int, help="replay at most N *new* trajectories")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--jobs", type=int, default=4, help="parallel verification workers")
+    parser.add_argument(
+        "--replay-jobs",
+        type=int,
+        default=None,
+        help="parallel replay workers (default: --jobs; 1 = serial, in-process)",
+    )
     parser.add_argument("--retry-failed", action="store_true")
     args = parser.parse_args(argv)
 
@@ -81,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     editable = {repo for repo, spec in REPO_SETUP.items() if spec.get("editable")}
     parallel = [r for r in new_records if r["repo"] not in editable]
     serial = [r for r in new_records if r["repo"] in editable]
+    replay_jobs = args.jobs if args.replay_jobs is None else args.replay_jobs
 
     ok_count = 0
     attempts = 0
@@ -92,16 +99,20 @@ def main(argv: list[str] | None = None) -> int:
         ok_count += 1
         print(f"  ok    {trajectory['meta']['steps']} steps", flush=True)
 
-    if parallel:
+    def _attempt(record: dict) -> None:
+        nonlocal attempts
+        attempts += 1
+        print(f"[replay] {record['task_id']} ({attempts}/{total})", flush=True)
+
+    if parallel and replay_jobs > 1:
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        print(f"[replay] {total} records -> {len(parallel)} parallel + {len(serial)} serial", flush=True)
-        with ProcessPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        print(f"[replay] {total} records -> {len(parallel)} parallel ({replay_jobs} workers) + {len(serial)} serial", flush=True)
+        with ProcessPoolExecutor(max_workers=replay_jobs) as pool:
             futures = {pool.submit(_replay_one, (r, args.timeout)): r for r in parallel}
             for future in as_completed(futures):
                 record = futures[future]
-                attempts += 1
-                print(f"[replay] {record['task_id']} ({attempts}/{total})", flush=True)
+                _attempt(record)
                 try:
                     trajectory = future.result()
                 except Exception as exc:  # noqa: BLE001 - keep the other episodes alive
@@ -111,10 +122,12 @@ def main(argv: list[str] | None = None) -> int:
                     print("  skip  replay did not end in a clean test pass", flush=True)
                     continue
                 _keep(trajectory)
+        queue = serial
+    else:
+        queue = parallel + serial  # serial keeps the original record order
 
-    for record in serial:
-        attempts += 1
-        print(f"[replay] {record['task_id']} ({attempts}/{total})", flush=True)
+    for record in queue:
+        _attempt(record)
         trajectory = replay_trajectory(record, timeout=args.timeout)
         if trajectory is None:
             print("  skip  replay did not end in a clean test pass", flush=True)

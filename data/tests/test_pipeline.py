@@ -330,7 +330,7 @@ def test_build_sft_replays_only_verified_sft_split(
 
     monkeypatch.setattr(build_sft_trajectories, "replay_trajectory", fake_replay)
 
-    rc = build_sft_trajectories.main(["--parquet", str(tiny_parquet)])
+    rc = build_sft_trajectories.main(["--parquet", str(tiny_parquet), "--replay-jobs", "1"])
     assert rc == 0
     trajectories = jsonl_read(tmp_path / "sft_trajectories.jsonl")
     assert trajectories
