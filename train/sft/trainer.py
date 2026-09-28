@@ -34,6 +34,11 @@ def resolve_base_model(config: dict[str, Any]) -> str:
     if config.get("base_model"):
         return str(config["base_model"])
     if _is_kaggle():
+        models = Path("/kaggle/input/models")
+        if models.is_dir():
+            mounted = sorted(models.glob("**/gemma-4-12b-it/*/config.json"))
+            if mounted:
+                return str(mounted[0].parent)
         import kagglehub
 
         return kagglehub.model_download(KAGGLE_SLUG)
