@@ -9,7 +9,9 @@
   "enable_tpu": "false",
   "enable_internet": "true",
   "machine_shape": "",
-  "dataset_sources": [],
+  "dataset_sources": [
+    "ashuraasura/gemma4-coding-agent-repo"
+  ],
   "competition_sources": [],
   "kernel_sources": [],
   "model_sources": []
