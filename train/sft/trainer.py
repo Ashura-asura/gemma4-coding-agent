@@ -171,6 +171,46 @@ def prepare_for_qlora(model: Any, torch: Any) -> Any:
     return model
 
 
+def resolve_lora_targets(model: Any, leaves: Any, torch: Any) -> list[str]:
+    """Exact module keys for LoRA injection over the policy language model.
+
+    Gemma-4's vision/audio towers reuse the q/k/v/o/gate/up/down projection
+    names inside ``Gemma4ClippableLinear`` wrappers, which peft refuses to
+    wrap (``ValueError: ... is not supported``); text-only SFT never touches
+    those towers, so when the model has a ``language_model`` component every
+    other subtree is excluded. A projection that *is* wrapped (future text
+    configs may clip) is targeted at its inner ``linear`` child — the concrete
+    nn.Linear/Linear4bit peft can actually wrap.
+    """
+    wanted = {str(leaf) for leaf in leaves}
+    modules = list(model.named_modules())
+    has_lm = any("language_model" in key.split(".") for key, _ in modules)
+    keys: list[str] = []
+    for key, module in modules:
+        parts = key.split(".")
+        if has_lm and "language_model" not in parts:
+            continue
+        if parts[-1] not in wanted:
+            continue
+        if isinstance(module, torch.nn.Linear):
+            keys.append(key)
+            continue
+        inner = [
+            f"{key}.{child_key}"
+            for child_key, child in module.named_modules()
+            if child_key and isinstance(child, torch.nn.Linear)
+        ]
+        if len(inner) != 1:
+            raise SystemExit(
+                f"[sft] cannot LoRA-target {key}: {type(module).__name__} has "
+                f"{len(inner)} Linear children (expected exactly 1)"
+            )
+        keys.append(inner[0])
+    if not keys:
+        raise SystemExit(f"[sft] target_modules {sorted(wanted)} matched no modules")
+    return sorted(set(keys))
+
+
 def training_arguments(config: dict[str, Any], torch: Any) -> Any:
     from transformers import TrainingArguments
 
@@ -238,13 +278,15 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
 
     model = prepare_for_qlora(model, torch)
     lora = config["lora"]
+    targets = resolve_lora_targets(model, lora["target_modules"], torch)
+    print(f"[sft] LoRA targets: {len(targets)} modules", flush=True)
     model = get_peft_model(
         model,
         LoraConfig(
             r=int(lora["r"]),
             lora_alpha=int(lora["alpha"]),
             lora_dropout=float(lora["dropout"]),
-            target_modules=list(lora["target_modules"]),
+            target_modules=targets,
             bias="none",
             task_type="CAUSAL_LM",
         ),
