@@ -112,11 +112,31 @@ def encode_trajectory(
     return {"input_ids": list(input_ids), "labels": list(labels)}
 
 
+def sliced_supervision(labels: Sequence[int]) -> tuple[list[int], list[int]]:
+    """(logit positions, target ids) for the completion-only loss.
+
+    Logits row ``p`` predicts token ``p+1``. Full-sequence CE drops label[0]
+    (nothing predicts position 0), so targets are supervised labels at t >= 1
+    and the matching logit rows are t - 1. Pairing them lets the model
+    project only the K supervised rows through the lm_head instead of the
+    whole padded sequence — with Gemma-4's vocab 262144 that is the
+    difference between fitting and OOMing a T4 (ARCHITECTURE §0.3).
+    """
+    keep = [t - 1 for t in range(1, len(labels)) if labels[t] != -100]
+    targets = [labels[t] for t in range(1, len(labels)) if labels[t] != -100]
+    return keep, targets
+
+
 class TrajectoryCollator:
     """Pad a pre-tokenized batch (labels pad with -100, ids with eos).
 
     ``tokenizer`` may be a processor — Gemma-4 is multimodal and exposes the
     chat template on ``AutoProcessor``, with the tokenizer underneath.
+
+    The batch also carries ``logits_to_keep``/``shift_labels``: the union of
+    supervised logit rows across the batch (1-D, shared seq index) plus the
+    per-row target ids (-100 where a row does not supervise that position),
+    which ``ForCausalLMLoss`` consumes via the model's ``**kwargs``.
     """
 
     def __init__(self, tokenizer: Any, pad_to_multiple_of: int | None = 8) -> None:
@@ -148,4 +168,20 @@ class TrajectoryCollator:
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "attention_mask": torch.tensor(attention, dtype=torch.long),
+            **self._sliced([sliced_supervision(row) for row in labels]),
+        }
+
+    @staticmethod
+    def _sliced(rows: list[tuple[list[int], list[int]]]) -> dict[str, torch.Tensor]:
+        positions = sorted({p for keep, _ in rows for p in keep})
+        if not positions:
+            return {}
+        index = {p: i for i, p in enumerate(positions)}
+        shift = torch.full((len(rows), len(positions)), -100, dtype=torch.long)
+        for r, (keep, targets) in enumerate(rows):
+            for p, target in zip(keep, targets):
+                shift[r, index[p]] = target
+        return {
+            "logits_to_keep": torch.tensor(positions, dtype=torch.long),
+            "shift_labels": shift,
         }

@@ -147,6 +147,30 @@ def build_dataset(path: str, processor: Any, config: dict[str, Any]):
     )
 
 
+def prepare_for_qlora(model: Any, torch: Any) -> Any:
+    """Freeze the base and fp32-cast only 1-D norms/biases.
+
+    peft's ``prepare_model_for_kbit_training`` upcasts *every* non-quantized
+    half-precision parameter to fp32; Gemma-4's per-layer embedding
+    ([262144, 10752] = 2.8B params, §0.3) would alone need 10.5 GiB and OOMs
+    a 16 GiB T4. Frozen tables stay in their load dtype (they get no
+    gradients). Gradient checkpointing is left to the Trainer
+    (non-reentrant — see ``training_arguments``), which activates it on the
+    PEFT-wrapped model at train() start.
+    """
+    half = (torch.float16, torch.bfloat16)
+    upcast = 0
+    for param in model.parameters():
+        param.requires_grad = False
+        if param.ndim == 1 and param.dtype in half:
+            param.data = param.data.to(torch.float32)
+            upcast += 1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"[sft] prepare_for_qlora: froze base, fp32-cast {upcast} norm/bias tensors", flush=True)
+    return model
+
+
 def training_arguments(config: dict[str, Any], torch: Any) -> Any:
     from transformers import TrainingArguments
 
@@ -163,6 +187,9 @@ def training_arguments(config: dict[str, Any], torch: Any) -> Any:
         lr_scheduler_type=str(train["lr_scheduler"]),
         warmup_ratio=float(train["warmup_ratio"]),
         gradient_checkpointing=bool(train["gradient_checkpointing"]),
+        # non-reentrant: recomputes without the input-require-grads hook,
+        # which a frozen base would otherwise need
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=float(train["max_grad_norm"]),
         seed=int(train["seed"]),
         bf16=bf16,
@@ -205,13 +232,11 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
     model, processor = load_model_and_processor(base, config)
     dataset = build_dataset(config["data"]["path"], processor, config)
 
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
 
     from train.sft.data_collator import TrajectoryCollator
 
-    model = prepare_model_for_kbit_training(
-        model, use_gradient_checkpointing=bool(config["training"]["gradient_checkpointing"])
-    )
+    model = prepare_for_qlora(model, torch)
     lora = config["lora"]
     model = get_peft_model(
         model,

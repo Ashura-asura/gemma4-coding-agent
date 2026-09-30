@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from train.sft.data_collator import TrajectoryCollator, as_ids, encode_trajectory
+from train.sft.data_collator import TrajectoryCollator, as_ids, encode_trajectory, sliced_supervision
 
 
 class FakeTokenizer:
@@ -99,3 +99,56 @@ def test_as_ids_handles_batch_encoding_userdict():
     # processor-style batched nested list still unwraps
     assert as_ids([[4, 5], [6]]) == [4, 5]
     assert as_ids([4, 5, 6]) == [4, 5, 6]
+
+
+def test_sliced_supervision_pairs_positions_with_targets():
+    labels = [-100, -100, 7, -100, 9, 10]
+    keep, targets = sliced_supervision(labels)
+    # t=2 -> logit row 1, t=4 -> row 3, t=5 -> row 4; label[0] is never a
+    # target (nothing predicts position 0 — the shift drops it)
+    assert keep == [1, 3, 4]
+    assert targets == [7, 9, 10]
+    # unsupervised-everything yields no slicing keys (full-logit fallback)
+    assert sliced_supervision([-100, -100, -100]) == ([], [])
+    assert sliced_supervision([9, -100, -100]) == ([], [])
+
+
+def test_collator_emits_sliced_keys_single_row():
+    tok = FakeTokenizer()
+    batch = TrajectoryCollator(tok, pad_to_multiple_of=8)([
+        encode_trajectory(tok, MESSAGES, max_seq_len=4096),
+    ])
+    keep, shift = batch["logits_to_keep"], batch["shift_labels"]
+    assert keep.ndim == 1 and shift.shape == (1, keep.numel())
+    labels = batch["labels"][0]
+    # each kept row p pairs with the supervised label at p+1, none masked
+    assert (shift[0] == labels[keep + 1]).all()
+    assert (shift[0] != -100).all()
+    assert (keep >= 0).all()
+
+
+def test_collator_sliced_union_fills_unsupervised_rows():
+    tok = FakeTokenizer()
+    a = encode_trajectory(tok, MESSAGES, max_seq_len=4096)
+    b = encode_trajectory(tok, MESSAGES[:2], max_seq_len=4096)
+    batch = TrajectoryCollator(tok, pad_to_multiple_of=8)([a, b])
+    keep, shift = batch["logits_to_keep"], batch["shift_labels"]
+    assert shift.shape == (2, keep.numel())
+    for r in range(2):
+        labels = batch["labels"][r]
+        expected = torch.where(
+            labels[keep + 1] != -100, labels[keep + 1], torch.full_like(keep, -100)
+        )
+        assert torch.equal(shift[r], expected)
+    # union covers at least each row's own targets
+    assert shift.shape[1] >= len(sliced_supervision(list(a["labels"]))[0])
+
+
+def test_collator_omits_sliced_keys_when_no_targets():
+    # encode_trajectory guarantees >=1 supervised token; this covers the
+    # guard: without targets the batch falls back to full-sequence logits
+    batch = TrajectoryCollator(FakeTokenizer(), pad_to_multiple_of=None)([
+        {"input_ids": [5, 6, 7], "labels": [-100, -100, -100]},
+    ])
+    assert "logits_to_keep" not in batch
+    assert "shift_labels" not in batch
