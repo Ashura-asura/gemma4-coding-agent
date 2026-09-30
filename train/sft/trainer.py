@@ -77,6 +77,13 @@ def _load_first_model(base: str, config: dict[str, Any], torch: Any) -> Any:
 
     import transformers
 
+    try:
+        import bitsandbytes as _bnb
+
+        print(f"[sft] bitsandbytes {_bnb.__version__}", flush=True)
+    except Exception as exc:
+        print(f"[sft] bitsandbytes unavailable: {exc}", flush=True)
+
     errors: list[str] = []
     for name in MODEL_CLASSES:
         cls = getattr(transformers, name, None)
@@ -85,6 +92,13 @@ def _load_first_model(base: str, config: dict[str, Any], torch: Any) -> Any:
         try:
             model = cls.from_pretrained(base, **kwargs)
             print(f"[sft] loaded with {name}", flush=True)
+            if bits == 4 and not getattr(model, "is_loaded_in_4bit", False):
+                raise SystemExit(
+                    "[sft] 4-bit quantization did not engage — training would OOM. "
+                    "Check the bitsandbytes pin in pyproject.toml."
+                )
+            placement = sorted({str(p.device) for p in model.parameters()})
+            print(f"[sft] param devices: {placement} | quantized={getattr(model, 'is_loaded_in_4bit', False)}", flush=True)
             return model
         except Exception as exc:  # arch registration differs across cards/versions
             errors.append(f"{name}: {type(exc).__name__}: {exc}")
