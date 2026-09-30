@@ -211,6 +211,66 @@ def resolve_lora_targets(model: Any, leaves: Any, torch: Any) -> list[str]:
     return sorted(set(keys))
 
 
+def _ce_chunk(logits_chunk: Any, targets: Any) -> Any:
+    import torch.nn.functional as F
+
+    return F.cross_entropy(logits_chunk.float(), targets, ignore_index=-100, reduction="sum")
+
+
+def chunked_sliced_ce(logits: Any, shift_labels: Any, chunk: int = 512) -> Any:
+    """Mean CE over the supervised rows, computed in row-chunks under
+    non-reentrant checkpointing.
+
+    The model-internal loss materialises the full fp32 [K, vocab] chain
+    (cast + log-softmax + grad): at seq_len 2048 with a high-K sample that
+    peaked past 4 GiB and OOM'd kernel v16 (alloc 14.22 GiB, next request
+    1.58 GiB = fp32 [1620, 262144] exactly). Chunking under checkpoint
+    keeps only the fp16 logits plus one chunk's fp32 working set (~1 GiB)
+    regardless of K, while staying numerically equal to
+    transformers' ForCausalLMLoss (mean over non-ignored targets).
+    """
+    from torch.utils.checkpoint import checkpoint
+    import torch
+
+    flat = logits.reshape(-1, logits.shape[-1])  # [B*K, V] — CE rows, not the batch axis
+    targets = shift_labels.reshape(-1)  # [B*K] (or [K] for B=1)
+    rows = int(flat.shape[0])
+    sums = [checkpoint(_ce_chunk, flat[s : s + chunk], targets[s : s + chunk], use_reentrant=False)
+            for s in range(0, rows, chunk)]
+    if not sums:
+        return logits.sum() * 0.0
+    count = int((targets != -100).sum())
+    return torch.stack(sums).sum() / max(count, 1)
+
+
+from transformers import Trainer  # noqa: E402  (mid-file: keeps --dry-run import path light above)
+
+
+class SlicedLossTrainer(Trainer):
+    """Trainer that computes the completion loss outside the model.
+
+    Keeps ``labels``/``shift_labels`` out of the forward pass so Gemma-4's
+    internal full-vocab fp32 loss graph never materialises; the collator's
+    sliced ``logits_to_keep`` still bounds the lm_head to supervised rows,
+    and ``chunked_sliced_ce`` bounds the CE working set per chunk.
+    """
+
+    def compute_loss(
+        self,
+        model: Any,
+        inputs: dict[str, Any],
+        return_outputs: bool = False,
+        num_items_in_batch: Any = None,
+    ) -> Any:
+        shift = inputs.pop("shift_labels", None)
+        inputs.pop("labels", None)
+        outputs = model(**inputs)
+        if shift is None:
+            raise SystemExit("[sft] collator did not emit shift_labels")
+        loss = chunked_sliced_ce(outputs.logits, shift)
+        return (loss, outputs) if return_outputs else loss
+
+
 def training_arguments(config: dict[str, Any], torch: Any) -> Any:
     from transformers import TrainingArguments
 
@@ -299,9 +359,7 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
     elif resume_from == "auto":
         resume_from = last_checkpoint(config["output_dir"])
 
-    from transformers import Trainer
-
-    trainer = Trainer(
+    trainer = SlicedLossTrainer(
         model=model,
         args=training_arguments(config, torch),
         train_dataset=dataset,

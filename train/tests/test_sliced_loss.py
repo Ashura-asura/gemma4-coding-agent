@@ -121,3 +121,76 @@ def test_sliced_backward_flows_gradients(tiny_gemma4):
     finally:
         tiny_gemma4.zero_grad(set_to_none=True)
         tiny_gemma4.eval()
+
+
+def _supervised(input_ids, labels):
+    seq = input_ids.shape[1]
+    keep = [t - 1 for t in range(1, seq) if labels[0, t] != -100]
+    shift = torch.tensor([labels[0, t] for t in range(1, seq) if labels[0, t] != -100])
+    return torch.tensor(keep), shift
+
+
+def test_chunked_ce_matches_model_loss(tiny_gemma4):
+    """chunked_sliced_ce (chunk=3, forced boundaries) == model-internal loss."""
+    from train.sft.trainer import chunked_sliced_ce
+
+    input_ids, labels = _inputs()
+    keep, shift = _supervised(input_ids, labels)
+    with torch.no_grad():
+        builtin = tiny_gemma4(
+            input_ids=input_ids, labels=labels, logits_to_keep=keep, shift_labels=shift
+        ).loss
+        logits = tiny_gemma4(input_ids=input_ids, logits_to_keep=keep).logits
+        chunked = chunked_sliced_ce(logits, shift, chunk=3)
+    assert torch.allclose(builtin, chunked, atol=1e-5)
+
+
+def test_chunked_ce_matches_with_softcap():
+    """E4B sets final_logit_softcapping=30 — chunked CE matches that path too."""
+    from train.sft.trainer import chunked_sliced_ce
+
+    torch.manual_seed(0)
+    text = Gemma4TextConfig(
+        num_hidden_layers=2, hidden_size=64, intermediate_size=128,
+        num_attention_heads=4, num_key_value_heads=4, head_dim=16, vocab_size=VOCAB,
+        hidden_size_per_layer_input=16, max_position_embeddings=512,
+        final_logit_softcapping=30.0,
+    )
+    model = Gemma4ForConditionalGeneration(Gemma4Config(text_config=text)).eval()
+    input_ids, labels = _inputs()
+    keep, shift = _supervised(input_ids, labels)
+    with torch.no_grad():
+        builtin = model(
+            input_ids=input_ids, labels=labels, logits_to_keep=keep, shift_labels=shift
+        ).loss
+        logits = model(input_ids=input_ids, logits_to_keep=keep).logits
+        chunked = chunked_sliced_ce(logits, shift, chunk=5)
+    assert torch.allclose(builtin, chunked, atol=1e-5)
+
+
+def test_sliced_loss_trainer_compute_loss(tiny_gemma4, tmp_path):
+    """SlicedLossTrainer pops label keys, skips the model loss, matches built-in."""
+    from transformers import TrainingArguments
+
+    from train.sft.trainer import SlicedLossTrainer
+
+    input_ids, labels = _inputs()
+    keep, shift = _supervised(input_ids, labels)
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": labels,
+        "logits_to_keep": keep,
+        "shift_labels": shift,
+    }
+    with torch.no_grad():
+        builtin = tiny_gemma4(
+            input_ids=input_ids, labels=labels, logits_to_keep=keep, shift_labels=shift
+        ).loss
+    args = TrainingArguments(output_dir=str(tmp_path / "t"), use_cpu=True, report_to=[])
+    trainer = SlicedLossTrainer(model=tiny_gemma4, args=args, train_dataset=[])
+    inputs = dict(batch)
+    loss = trainer.compute_loss(tiny_gemma4, inputs)
+    assert torch.allclose(builtin, loss, atol=1e-5)
+    assert "labels" not in inputs and "shift_labels" not in inputs
+    assert "logits_to_keep" in inputs  # forward still gets the slice
