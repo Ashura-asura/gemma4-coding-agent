@@ -307,16 +307,34 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
         train_dataset=dataset,
         data_collator=TrajectoryCollator(processor),
     )
+    sample = TrajectoryCollator(processor)([dataset[0]])
+    keep = sample.get("logits_to_keep")
+    print(
+        f"[sft] batch keys={sorted(sample)} K={keep.numel() if keep is not None else 'FULL'} | "
+        f"gradient_checkpointing={trainer.model.is_gradient_checkpointing} | "
+        f"cuda alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB "
+        f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GiB",
+        flush=True,
+    )
     try:
         trainer.train(resume_from_checkpoint=resume_from)
-    except torch.cuda.OutOfMemoryError:
+    except torch.cuda.OutOfMemoryError as exc:
         # §0.3 fallback: rerun with base_model_fallback (E4B) — progress under
         # a different base can't resume, so fail loudly instead of corrupting
         trainer.save_state()
+        print(
+            f"[sft] OOM detail: {exc}\n"
+            f"[sft] cuda at OOM: alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB "
+            f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GiB",
+            file=sys.stderr,
+            flush=True,
+        )
         fallback = config.get("base_model_fallback")
         hint = " --base-model fallback" if fallback else ""
         print(
-            f"[sft] CUDA OOM — checkpoint state saved. Rerun with the E4B fallback:\n"
+            f"[sft] CUDA OOM — checkpoint state saved. Next levers: lower "
+            f"training.max_seq_len (now {config['training']['max_seq_len']}), or rerun with "
+            f"the E4B fallback:\n"
             f"      python -m train.sft.trainer --config {config_path}{hint}",
             file=sys.stderr,
             flush=True,

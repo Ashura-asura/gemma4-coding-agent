@@ -93,9 +93,36 @@ def test_model_without_language_model_scans_whole_tree():
     assert keys == ["nested", "q_proj"]
 
 
+def get_peft_model_safe(model, keys):
+    """get_peft_model, skipping when the env's torchao trips peft's dispatcher.
+
+    peft probes torchao before the default (nn.Linear) dispatcher; containers
+    shipping torchao <0.16 make transformers' ``is_torchao_available()`` raise
+    ImportError instead of returning False. Real QLoRA never reaches that probe
+    (bnb4 matches Linear4bit first) — only this unquantized CPU test does.
+    """
+    from peft import LoraConfig, get_peft_model
+
+    try:
+        return get_peft_model(
+            model,
+            LoraConfig(
+                r=8,
+                lora_alpha=16,
+                lora_dropout=0.0,
+                target_modules=keys,
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
+        )
+    except ImportError as exc:
+        if "torchao" in str(exc).lower():
+            pytest.skip(f"env torchao version check: {exc}")
+        raise
+
+
 def test_tiny_gemma4_end_to_end_wraps_and_trains():
     """Real architecture: resolve keys -> get_peft_model -> backward on LoRA."""
-    from peft import LoraConfig, get_peft_model
     from transformers import Gemma4Config, Gemma4ForConditionalGeneration, Gemma4TextConfig
 
     torch.manual_seed(0)
@@ -117,17 +144,7 @@ def test_tiny_gemma4_end_to_end_wraps_and_trains():
     assert len(keys) == 14
     assert all("language_model" in key for key in keys)
 
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=8,
-            lora_alpha=16,
-            lora_dropout=0.0,
-            target_modules=keys,
-            bias="none",
-            task_type="CAUSAL_LM",
-        ),
-    )
+    model = get_peft_model_safe(model, keys)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     assert trainable > 0
 
