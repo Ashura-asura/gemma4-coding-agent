@@ -19,7 +19,7 @@ dev = [
 train = [
     "torch",
     "torchvision",
-    "transformers>=5.14.1",  # older versions lack gemma4_unified (Kaggle container ships old)
+    "transformers==5.14.1",  # exact: known-good for gemma4_unified + TrainingArguments (warmup_ratio removed in newer)
     "peft",
     "trl",
     "datasets",
