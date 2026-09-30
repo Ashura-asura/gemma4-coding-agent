@@ -21,7 +21,9 @@ from typing import Any
 import yaml
 
 KAGGLE_SLUG = "google/gemma-4/transformers/gemma-4-12b-it"
+KAGGLE_SLUG_E4B = "google/gemma-4/transformers/gemma-4-e4b-it"
 HF_SLUG = "google/gemma-4-12B-it"
+HF_SLUG_E4B = "google/gemma-4-E4B-it"
 MODEL_CLASSES = ("AutoModelForCausalLM", "AutoModelForImageTextToText", "AutoModelForMultimodalLM")
 
 
@@ -29,25 +31,27 @@ def _is_kaggle() -> bool:
     return bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE")) or Path("/kaggle/input").exists()
 
 
-def resolve_base_model(config: dict[str, Any]) -> str:
-    """Config value > Kaggle model download > HF hub (§0.3: 12B-it primary)."""
-    if config.get("base_model"):
+def resolve_base_model(config: dict[str, Any], *, which: str = "primary") -> str:
+    """Config value > Kaggle model download > HF hub (§0.3: 12B primary, E4B fallback)."""
+    if which == "primary" and config.get("base_model"):
         return str(config["base_model"])
+    fallback = which == "fallback"
     if _is_kaggle():
         models = Path("/kaggle/input/models")
+        pattern = "gemma-4-e4b-it/*/config.json" if fallback else "gemma-4-12b-it/*/config.json"
         if models.is_dir():
-            mounted = sorted(models.glob("**/gemma-4-12b-it/*/config.json"))
+            mounted = sorted(models.glob(f"**/{pattern}"))
             if mounted:
                 return str(mounted[0].parent)
         import kagglehub
 
-        return kagglehub.model_download(KAGGLE_SLUG)
-    return HF_SLUG
+        return kagglehub.model_download(KAGGLE_SLUG_E4B if fallback else KAGGLE_SLUG)
+    return HF_SLUG_E4B if fallback else HF_SLUG
 
 
 def _dtype(name: str, torch: Any) -> Any:
     wanted = getattr(torch, name)
-    if wanted == torch.bfloat16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+    if wanted == torch.bfloat16 and torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
         # T4/P100 (§5) have no bf16 tensor cores — fp16 keeps the config's intent
         print("[sft] bf16 unsupported on this GPU; using float16", flush=True)
         return torch.float16
@@ -178,7 +182,10 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
         raise SystemExit("[sft] training needs a GPU (ARCHITECTURE §5) — use --dry-run for a CPU check")
 
     config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-    base = base_override or resolve_base_model(config)
+    if base_override == "fallback":
+        base = resolve_base_model(config, which="fallback")
+    else:
+        base = base_override or resolve_base_model(config)
     print(f"[sft] base model: {base}", flush=True)
 
     model, processor = load_model_and_processor(base, config)
@@ -226,7 +233,7 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
         # a different base can't resume, so fail loudly instead of corrupting
         trainer.save_state()
         fallback = config.get("base_model_fallback")
-        hint = f" --base-model {fallback}" if fallback else ""
+        hint = " --base-model fallback" if fallback else ""
         print(
             f"[sft] CUDA OOM — checkpoint state saved. Rerun with the E4B fallback:\n"
             f"      python -m train.sft.trainer --config {config_path}{hint}",
@@ -257,7 +264,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     config = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    base = args.base_model or resolve_base_model(config)
+    if args.base_model == "fallback":
+        base = resolve_base_model(config, which="fallback")
+    else:
+        base = args.base_model or resolve_base_model(config)
 
     if args.dry_run:
         from transformers import AutoProcessor

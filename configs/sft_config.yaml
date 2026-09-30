@@ -2,7 +2,7 @@
 # Base model: Gemma-4 12B primary target; E4B fallback if 12B is tight (§0.3, §5).
 
 base_model: null            # set to local path or hub id, e.g. "google/gemma-4-12b-it"
-base_model_fallback: null   # E4B path, used if 12B OOMs once optimizer state is added
+base_model_fallback: google/gemma-4-e4b-it   # §0.3: 12B OOMs on T4 (fp32 full-vocab logits) → run with --base-model fallback
 
 method: qlora
 quantization:
@@ -29,7 +29,7 @@ training:
   learning_rate: 2.0e-4
   lr_scheduler: cosine
   warmup_ratio: 0.03
-  max_seq_len: 8192
+  max_seq_len: 2048       # vocab 262144: loss upcasts logits fp32 (~1MB/token) — 2048 fits 16GB T4 (§0.3)
   gradient_checkpointing: true
   max_grad_norm: 1.0
   seed: 0
