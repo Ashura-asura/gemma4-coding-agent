@@ -19,7 +19,7 @@ dev = [
 train = [
     "torch",
     "torchvision",
-    "transformers",
+    "transformers>=5.14.1",  # older versions lack gemma4_unified (Kaggle container ships old)
     "peft",
     "trl",
     "datasets",
