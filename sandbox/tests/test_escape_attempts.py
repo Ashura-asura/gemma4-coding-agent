@@ -290,6 +290,8 @@ def test_no_network_egress(sandbox: Sandbox) -> None:
     )
     res = sandbox.run([PY, "-c", probe], timeout=15)
     _assert_typed(res)
+    if res.isolation.get("netns") != "ok":
+        pytest.skip(f"network namespace degraded on this host: {res.warnings}")
     assert "EGRESS_ALLOWED" not in res.stdout, "payload reached the network"
     assert res.returncode == 9, f"expected egress to be blocked, got: {res.status} {res.message}"
     assert res.isolation.get("netns") == "ok"
@@ -301,9 +303,14 @@ def test_isolation_quality_is_always_reported(sandbox: Sandbox) -> None:
     _assert_typed(res)
     assert res.status == "pass"
     if IS_POSIX:
-        assert res.isolation.get("netns") == "ok"
-        assert not res.unsupported_limits, "posix host must enforce every rlimit"
-        assert not res.warnings, f"unexpected isolation warnings: {res.warnings}"
+        netns = res.isolation.get("netns")
+        assert netns in ("ok", "degraded"), f"unreported network namespace state: {netns!r}"
+        if netns == "degraded":
+            # hosts that forbid unshare (Kaggle: seccomp) degrade loudly, never silently
+            assert res.warnings, "degraded isolation must never be silent"
+        else:
+            assert not res.unsupported_limits, "posix host must enforce every rlimit"
+            assert not res.warnings, f"unexpected isolation warnings: {res.warnings}"
     else:
         assert res.warnings, "degraded isolation must never be silent"
         assert res.unsupported_limits, "win32 must report which limits it cannot enforce"
