@@ -155,9 +155,6 @@ class Sandbox:
         self.limits = limits or Limits()
         names = DEFAULT_ALLOWLIST if allowlist is None else allowlist
         self.allowlist = frozenset(_executable_stem(n) for n in names)
-        # degraded isolation is opt-in everywhere except win32, which has no
-        # network namespace API at all (dev host only — see ARCHITECTURE §5)
-        self.allow_degraded = (sys.platform == "win32") if allow_degraded is None else allow_degraded
         self.launcher = Path(__file__).resolve().parent / "launcher.py"
         # pid namespace + read-only rootfs + dropped capabilities (AUDIT C2).
         # "required" fails closed; training/eval scripts set it via
@@ -166,6 +163,14 @@ class Sandbox:
         if mode not in FS_MODES:
             raise SandboxError(f"fs_isolation must be one of {FS_MODES}, got {mode!r}")
         self.fs_isolation = "off" if os.name != "posix" else mode
+        # degraded network isolation is the default everywhere except a
+        # "required" run: hosts that forbid unshare (Kaggle: seccomp, no
+        # CAP_SYS_ADMIN) must still be able to run, loudly marked degraded.
+        # win32 has no network namespace API at all (dev host — ARCHITECTURE §5).
+        if allow_degraded is None:
+            self.allow_degraded = sys.platform == "win32" or self.fs_isolation != "required"
+        else:
+            self.allow_degraded = allow_degraded
 
     # ------------------------------------------------------------------ paths
     def resolve_path(self, path: str | Path, *, must_exist: bool = False) -> Path:

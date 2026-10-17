@@ -118,7 +118,12 @@ def _payload_process(payload, root, fs_mode, pid_ns, report_w) -> None:
         results, warnings = fs.harden_child(root, mode=fs_mode, pid_namespace=pid_ns)
         report = {"fs": results, "warnings": warnings}
     except fs.FsIsolationError as exc:
-        report = {"error": f"filesystem isolation failed: {exc}"}
+        if fs_mode == "required":
+            report = {"error": f"filesystem isolation failed: {exc}"}
+        else:
+            # hosts without mount namespaces (Kaggle: unshare is seccomp-blocked)
+            # run the payload unhardened, marked degraded in the status file
+            report = {"fs": {}, "warnings": [f"filesystem isolation degraded: {exc}"]}
     os.write(report_w, json.dumps(report).encode("utf-8"))
     if "error" in report:
         print(f"launcher: {report['error']}", file=sys.stderr)
