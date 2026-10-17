@@ -262,12 +262,59 @@ class SlicedLossTrainer(Trainer):
         return_outputs: bool = False,
         num_items_in_batch: Any = None,
     ) -> Any:
+        import torch
+        import traceback
+
         shift = inputs.pop("shift_labels", None)
         inputs.pop("labels", None)
-        outputs = model(**inputs)
         if shift is None:
             raise SystemExit("[sft] collator did not emit shift_labels")
-        loss = chunked_sliced_ce(outputs.logits, shift)
+        first = not getattr(self, "_sft_diag_done", False)
+        if first:
+            print(
+                f"[sft] step0 keys={sorted(inputs)} K={shift.numel()} "
+                f"alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB",
+                flush=True,
+            )
+        try:
+            outputs = model(**inputs)
+        except torch.cuda.OutOfMemoryError:
+            print(
+                f"[sft] OOM in model forward | K={shift.numel()} "
+                f"alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB\n"
+                f"{traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        if first:
+            self._sft_diag_done = True
+            print(
+                f"[sft] step0 logits={tuple(outputs.logits.shape)} "
+                f"dtype={outputs.logits.dtype} model_loss="
+                f"{getattr(outputs, 'loss', None) is not None} ckpt="
+                f"{getattr(model, 'is_gradient_checkpointing', '?')} "
+                f"alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB",
+                flush=True,
+            )
+        try:
+            loss = chunked_sliced_ce(outputs.logits, shift)
+        except torch.cuda.OutOfMemoryError:
+            print(
+                f"[sft] OOM in chunked CE | K={shift.numel()} "
+                f"logits={tuple(outputs.logits.shape)} {outputs.logits.dtype} "
+                f"alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB\n"
+                f"{traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        if first:
+            print(
+                f"[sft] step0 loss={float(loss):.4f} "
+                f"alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB",
+                flush=True,
+            )
         return (loss, outputs) if return_outputs else loss
 
 
@@ -370,6 +417,7 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
     print(
         f"[sft] batch keys={sorted(sample)} K={keep.numel() if keep is not None else 'FULL'} | "
         f"gradient_checkpointing={trainer.model.is_gradient_checkpointing} | "
+        f"attn={getattr(getattr(trainer.model, 'config', None), '_attn_implementation', '?')} | "
         f"cuda alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB "
         f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GiB",
         flush=True,
@@ -379,11 +427,14 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
     except torch.cuda.OutOfMemoryError as exc:
         # §0.3 fallback: rerun with base_model_fallback (E4B) — progress under
         # a different base can't resume, so fail loudly instead of corrupting
+        import traceback
+
         trainer.save_state()
         print(
             f"[sft] OOM detail: {exc}\n"
             f"[sft] cuda at OOM: alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB "
-            f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GiB",
+            f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GiB\n"
+            f"[sft] OOM traceback:\n{traceback.format_exc()}",
             file=sys.stderr,
             flush=True,
         )
