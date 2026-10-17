@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Sequence
 
+from .fsisolation import MODES as FS_MODES
 from .limits import Limits
 
 Status = Literal["pass", "fail", "timeout", "error"]
@@ -146,6 +147,7 @@ class Sandbox:
         limits: Limits | None = None,
         allowlist: Iterable[str] | None = None,
         allow_degraded: bool | None = None,
+        fs_isolation: str | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         if not self.root.is_dir():
@@ -157,6 +159,13 @@ class Sandbox:
         # network namespace API at all (dev host only — see ARCHITECTURE §5)
         self.allow_degraded = (sys.platform == "win32") if allow_degraded is None else allow_degraded
         self.launcher = Path(__file__).resolve().parent / "launcher.py"
+        # pid namespace + read-only rootfs + dropped capabilities (AUDIT C2).
+        # "required" fails closed; training/eval scripts set it via
+        # SANDBOX_FS_ISOLATION=required. win32 has no such primitives.
+        mode = fs_isolation or os.environ.get("SANDBOX_FS_ISOLATION", "best_effort")
+        if mode not in FS_MODES:
+            raise SandboxError(f"fs_isolation must be one of {FS_MODES}, got {mode!r}")
+        self.fs_isolation = "off" if os.name != "posix" else mode
 
     # ------------------------------------------------------------------ paths
     def resolve_path(self, path: str | Path, *, must_exist: bool = False) -> Path:
@@ -269,6 +278,15 @@ class Sandbox:
             ]
             if self.allow_degraded:
                 cmd.append("--allow-degraded")
+            if self.fs_isolation != "off":
+                cmd += ["--fs-mode", self.fs_isolation, "--root", str(self.root)]
+                # the tree is read-only under isolation: scratch space and HOME
+                # live inside the (writable) sandbox root
+                scratch = self.root / ".sandbox-tmp"
+                scratch.mkdir(exist_ok=True)
+                for key in ("TMPDIR", "TMP", "TEMP"):
+                    env[key] = str(scratch)
+                env["HOME"] = str(scratch)
             cmd += ["--", program, *payload[1:]]
 
             proc = subprocess.Popen(
@@ -297,8 +315,11 @@ class Sandbox:
                     out, err = b"", b""
                 timed_out = True
 
-            if isolation is None:
-                isolation = self._read_status(status_path)
+            # the launcher rewrites the status once filesystem hardening is
+            # done; prefer that final version over the early read
+            final = self._read_status(status_path)
+            if final:
+                isolation = final
 
         duration = time.monotonic() - started
         stdout = (out or b"").decode("utf-8", errors="replace")

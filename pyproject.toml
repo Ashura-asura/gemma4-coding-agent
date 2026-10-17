@@ -44,3 +44,7 @@ packages = [
 [tool.pytest.ini_options]
 testpaths = ["sandbox/tests", "agent/tests", "eval/tests", "data/tests", "train/tests", "train/rl/tests"]
 addopts = "-q"
+
+[tool.ruff.lint.per-file-ignores]
+# notebooks interleave shell/pip steps with imports inside cells
+"*.ipynb" = ["E401", "E402"]

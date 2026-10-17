@@ -27,7 +27,7 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -619,7 +619,7 @@ def test_specs(instance: dict[str, Any], *, python: Path | str, p2p_cap: int = 0
         if raw_labels:
             specs.append({"runner": "django", "base": django_base,
                           "targets": _fit(sorted(set(raw_labels))), "k_expr": ""})
-        files = sorted(set(_django_label_to_file(l) for l in raw_labels) | set(test_files))
+        files = sorted(set(_django_label_to_file(row) for row in raw_labels) | set(test_files))
         file_labels = _fit(sorted(set(django_label_for(f) for f in files)))
         if file_labels and (not specs or file_labels != specs[0]["targets"]):
             specs.append({"runner": "django", "base": django_base,

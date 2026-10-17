@@ -127,7 +127,7 @@ def build_dataset(path: str, processor: Any, config: dict[str, Any]):
     """jsonl trajectories -> pre-tokenized dataset with completion-only labels."""
     from datasets import Dataset
 
-    from train.sft.data_collator import encode_trajectory
+    from train.sft.data_collator import encode_trajectory_ex
 
     records = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
     records = [record for record in records if len(record.get("messages") or []) >= 2]
@@ -135,16 +135,30 @@ def build_dataset(path: str, processor: Any, config: dict[str, Any]):
         raise SystemExit(f"no trajectories in {path} — finish the data build first (§2.1)")
     max_seq_len = int(config["training"]["max_seq_len"])
 
-    def _encode(record: dict[str, Any]) -> dict[str, list[int]]:
-        return encode_trajectory(processor, record["messages"], max_seq_len)
+    def _encode(record: dict[str, Any]) -> dict[str, Any]:
+        encoded, info = encode_trajectory_ex(processor, record["messages"], max_seq_len)
+        return {**encoded, **{f"_fit_{k}": v for k, v in info.items()}}
 
     dataset = Dataset.from_list([{"messages": record["messages"]} for record in records])
-    return dataset.map(
+    dataset = dataset.map(
         _encode,
         remove_columns=["messages"],
         desc="encoding trajectories",
         num_proc=1 if sys.platform == "win32" else 2,
     )
+    # report how much had to be cut so silent truncation can never hide again
+    n = len(dataset)
+    dropped = sum(dataset["_fit_dropped_turns"])
+    shrunk = sum(1 for v in dataset["_fit_shrunk_messages"] if v)
+    hard = sum(dataset["_fit_hard_truncated"])
+    print(
+        f"[sft] {n} trajectories at max_seq_len={max_seq_len}: "
+        f"{dropped} old turns dropped, {shrunk} trajectories with shrunk observations, "
+        f"{hard} hard-truncated ({100 * hard / max(n, 1):.1f}%)"
+    )
+    if hard / max(n, 1) > 0.05:
+        print("[sft] WARNING: >5% of examples are hard-truncated; raise max_seq_len or tighten the data")
+    return dataset.remove_columns([c for c in dataset.column_names if c.startswith("_fit_")])
 
 
 def prepare_for_qlora(model: Any, torch: Any) -> Any:
@@ -262,13 +276,13 @@ class SlicedLossTrainer(Trainer):
         return_outputs: bool = False,
         num_items_in_batch: Any = None,
     ) -> Any:
-        import torch
-        import traceback
-
         shift = inputs.pop("shift_labels", None)
         inputs.pop("labels", None)
         if shift is None:
             raise SystemExit("[sft] collator did not emit shift_labels")
+        import torch
+        import traceback
+
         first = not getattr(self, "_sft_diag_done", False)
         if first:
             print(

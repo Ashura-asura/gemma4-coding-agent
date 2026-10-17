@@ -7,7 +7,11 @@ from sandbox import SandboxError
 
 from . import BaseTool, ToolError
 
-MAX_LINES = 2000
+#: hard cap on lines returned by one call (AUDIT C4: whole-file reads of
+#: 2000-line modules made trajectories 10x longer than the SFT context)
+MAX_LINES = 400
+#: a read without a range returns this many lines and says how to get more
+DEFAULT_WINDOW = 250
 MAX_BYTES = 1_000_000
 
 
@@ -41,7 +45,9 @@ class ReadFile(BaseTool):
 
         lines = text.splitlines()
         first = 1 if start_line is None else int(start_line)
-        last = len(lines) if end_line is None else int(end_line)
+        ranged = start_line is not None or end_line is not None
+        default_cap = None if ranged or len(lines) <= DEFAULT_WINDOW else DEFAULT_WINDOW
+        last = (len(lines) if default_cap is None else default_cap) if end_line is None else int(end_line)
         if first < 1:
             raise ToolError("start_line must be >= 1")
         if last < first:
@@ -61,4 +67,9 @@ class ReadFile(BaseTool):
         )
         if truncated:
             rendered += f"\n... truncated at {MAX_LINES} lines"
+        elif default_cap is not None:
+            rendered += (
+                f"\n... showing lines 1-{default_cap} of {len(lines)}; "
+                "pass start_line/end_line to read more"
+            )
         return rendered

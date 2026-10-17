@@ -7,7 +7,7 @@ empty result — §2.3 applies to tools too).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from sandbox import Sandbox
@@ -109,11 +109,23 @@ def tool_schemas(tools: dict[str, BaseTool]) -> list[dict[str, Any]]:
     return [tools[name].schema() for name in sorted(tools)]
 
 
+def default_tool_specs() -> list[dict[str, Any]]:
+    """Chat-template ``tools=`` payload for the fixed five-tool interface.
+
+    Passed to ``apply_chat_template`` by SFT encoding, RL and eval so the
+    model always sees the same argument schemas it was trained with (the
+    original code never passed ``tools=`` at all).
+    """
+    toolset = build_toolset(ToolEnv(sandbox=None))  # type: ignore[arg-type]
+    return [{"type": "function", "function": schema} for schema in tool_schemas(toolset)]
+
+
 def dumps(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True)
 
 
 __all__ = [
+    "default_tool_specs",
     "BaseTool",
     "ToolEnv",
     "ToolError",

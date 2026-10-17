@@ -27,7 +27,7 @@ class FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 1
 
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, tools=None):
         ids = [ord(c) % 300 + 3 for m in messages for c in (m.get("content") or "")]
         return ids if tokenize else "".join(m.get("content") or "" for m in messages)
 

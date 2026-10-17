@@ -70,6 +70,7 @@ def episode_reward(
         "steps": int(steps),
         "resolved": bool(score.get("resolved")),
         "patch_valid": bool(score.get("patch_valid")),
+        "infra_error": bool(score.get("infra_error")),
         "test_status": score.get("test_status"),
         "reason": score.get("reason"),
         "components": {
@@ -91,3 +92,65 @@ def group_normalize(rewards: Sequence[float], eps: float = 1e-8) -> list[float]:
     if std < eps:
         return [0.0 for _ in rewards]
     return [(r - mean) / (std + eps) for r in rewards]
+
+
+# --------------------------------------------------- training-signal shaping
+def effective_rewards(
+    components: Sequence[dict[str, float]],
+    resolved: Sequence[bool],
+    infra: Sequence[bool],
+    *,
+    shaping: str = "gated",
+) -> list[float]:
+    """Rewards actually used for the policy gradient (AUDIT H2).
+
+    Success on SWE-bench-style tasks is rare, so in most groups *nobody*
+    passes. With std-normalisation the tiny shaping terms (patch validity,
+    step penalty) were blown up to unit-variance advantages and the policy
+    was trained to submit applying patches quickly regardless of
+    correctness. ``shaping="gated"`` (default) therefore applies validity and
+    step terms only in groups where at least one rollout genuinely resolved
+    the task; the no-submit penalty (a pure format failure) always applies.
+    ``"always"`` restores the old behaviour.
+    """
+    if shaping not in ("gated", "always"):
+        raise ValueError(f"shaping must be 'gated' or 'always', got {shaping!r}")
+    any_resolved = any(r and not i for r, i in zip(resolved, infra))
+    out: list[float] = []
+    for comp in components:
+        reward = comp.get("test_pass", 0.0) + comp.get("no_submit_penalty", 0.0)
+        if shaping == "always" or any_resolved:
+            reward += comp.get("patch_validity", 0.0) + comp.get("step_penalty", 0.0)
+        out.append(reward)
+    return out
+
+
+def group_advantages(
+    rewards: Sequence[float],
+    infra: Sequence[bool] | None = None,
+    *,
+    scale_by_std: bool = False,
+    eps: float = 1e-8,
+) -> list[float]:
+    """Mean-baseline advantages; infrastructure failures get 0 and are ignored.
+
+    Dividing by the group std (the original behaviour) over-weights groups with
+    almost no variance; the default here follows Dr. GRPO and only centres.
+    A rollout killed by a resource limit says nothing about the policy, so it
+    neither contributes to the baseline nor receives a gradient.
+    """
+    infra = list(infra) if infra is not None else [False] * len(rewards)
+    valid = [r for r, bad in zip(rewards, infra) if not bad]
+    if not valid:
+        return [0.0 for _ in rewards]
+    mean = sum(valid) / len(valid)
+    std = (sum((r - mean) ** 2 for r in valid) / len(valid)) ** 0.5
+    out: list[float] = []
+    for r, bad in zip(rewards, infra):
+        if bad:
+            out.append(0.0)
+        elif scale_by_std:
+            out.append(0.0 if std < eps else (r - mean) / (std + eps))
+        else:
+            out.append(r - mean)
+    return out

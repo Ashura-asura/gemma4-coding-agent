@@ -1,5 +1,10 @@
 # Gemma-4 Coding Agent
 
+> **Audit branch (`audit-fixes`)** — scoring, sandbox, tool-call parsing, SFT data and GRPO were
+> reviewed and fixed; see [AUDIT.md](AUDIT.md) for findings, verification and residual risks.
+> Regenerate the SFT file with `python -m data.scripts.compact_sft_trajectories` before training.
+
+
 Post-trained Gemma 4 into an autonomous software-engineering agent that
 resolves real repo issues offline, on consumer hardware. Entry for the
 Kaggle Developer Agent Competition (Paper Track).

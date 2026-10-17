@@ -18,6 +18,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import fsisolation as fs
 from .limits import LimitError, Limits, apply as apply_limits
 
 IS_POSIX = os.name == "posix"
@@ -104,7 +105,13 @@ def _isolate_mounts() -> str:
         return f"degraded: {exc}"
 
 
-def prepare(status_path: Path, limits: Limits, *, allow_degraded: bool) -> dict:
+def prepare(
+    status_path: Path,
+    limits: Limits,
+    *,
+    allow_degraded: bool,
+    fs_mode: str = "off",
+) -> dict:
     """Isolate the current process, then write a status file.
 
     Returns the status dict on success. On any hard failure the status file
@@ -116,6 +123,9 @@ def prepare(status_path: Path, limits: Limits, *, allow_degraded: bool) -> dict:
         "platform": sys.platform,
         "netns": "not_attempted",
         "mountns": "not_attempted",
+        "loopback": "not_attempted",
+        "pidns": "off",
+        "fs_mode": fs_mode,
         "rlimits": {},
         "unsupported_rlimits": list(limits.unsupported()),
         "warnings": [],
@@ -140,9 +150,29 @@ def prepare(status_path: Path, limits: Limits, *, allow_degraded: bool) -> dict:
                 status["netns"] = "degraded"
                 status["warnings"].append(f"network isolation degraded: {exc}")
 
+            if status["netns"] == "ok":
+                status["loopback"] = fs.bring_up_loopback()
+                if status["loopback"] != "ok":
+                    status["warnings"].append(f"loopback not available: {status['loopback']}")
+
             status["mountns"] = _isolate_mounts()
             if status["mountns"].startswith("degraded"):
                 status["warnings"].append(status["mountns"])
+                if fs_mode == "required":
+                    raise IsolationError(
+                        "mount namespace unavailable but fs isolation is required: "
+                        + status["mountns"]
+                    )
+
+            if fs_mode != "off":
+                try:
+                    fs.unshare_pid()
+                    status["pidns"] = "ok"
+                except fs.FsIsolationError as exc:
+                    status["pidns"] = f"degraded: {exc}"
+                    status["warnings"].append(f"pid namespace unavailable: {exc}")
+                    if fs_mode == "required":
+                        raise IsolationError(f"pid namespace required: {exc}") from exc
 
             status["rlimits"] = apply_limits(limits)
         else:

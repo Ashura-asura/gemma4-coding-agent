@@ -9,7 +9,26 @@ import json
 from collections.abc import Mapping
 from typing import Any, Sequence
 
-import torch
+try:  # torch is only needed by the collator; encoding works without it
+    import torch
+except ImportError:  # pragma: no cover - exercised on CPU-only CI
+    torch = None  # type: ignore[assignment]
+
+#: marker value: render with the repo's default five-tool schemas
+DEFAULT_TOOLS = "default"
+
+
+def _resolve_tools(tools: Any) -> list[dict[str, Any]] | None:
+    if tools == DEFAULT_TOOLS:
+        from agent.tools import default_tool_specs
+
+        return default_tool_specs()
+    return tools or None
+
+
+def strip_training_flags(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop bookkeeping keys (``train``) the chat template must never see."""
+    return [{k: v for k, v in dict(m).items() if k != "train"} for m in messages]
 
 
 def deserialize_tool_args(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -50,49 +69,139 @@ def as_ids(rendered: Any) -> list[int]:
     return list(rendered)
 
 
-def _prefix_lengths(template_owner: Any, messages: Sequence[dict[str, Any]]) -> list[int]:
+def _render(template_owner: Any, messages: Sequence[dict[str, Any]], tools: Any) -> list[int]:
+    kwargs: dict[str, Any] = {"tokenize": True, "add_generation_prompt": False}
+    if tools:
+        kwargs["tools"] = tools
+    return as_ids(template_owner.apply_chat_template(list(messages), **kwargs))
+
+
+def _prefix_lengths(template_owner: Any, messages: Sequence[dict[str, Any]], tools: Any = None) -> list[int]:
     """Token count of each message prefix under the chat template.
 
     Turn-based templates (Gemma/Qwen) render prefixes concatenatively, so
     prefix[i] is the end offset of message i in the full rendering; a
     non-concatenative template still yields monotone-clamped usable bounds.
     """
-    lengths: list[int] = []
-    for index in range(1, len(messages) + 1):
-        rendered = template_owner.apply_chat_template(
-            list(messages[:index]), tokenize=True, add_generation_prompt=False
-        )
-        lengths.append(len(as_ids(rendered)))
-    return lengths
+    return [
+        len(_render(template_owner, messages[:index], tools))
+        for index in range(1, len(messages) + 1)
+    ]
 
 
-def encode_trajectory(
+def _shrink_text(text: str, keep_head: float = 0.65, keep_tail: float = 0.15, factor: float = 0.5) -> str:
+    """Cut the middle out of a long observation, keeping both ends."""
+    target = max(200, int(len(text) * factor))
+    if len(text) <= target:
+        return text
+    head = int(target * keep_head / (keep_head + keep_tail))
+    tail = target - head
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n...[{omitted} chars truncated]...\n{text[len(text) - tail:]}"
+
+
+def fit_messages(
     template_owner: Any,
     messages: Sequence[dict[str, Any]],
     max_seq_len: int,
-) -> dict[str, list[int]]:
-    """Render one trajectory to ``input_ids``/``labels`` with assistant-only loss.
+    tools: Any = None,
+    *,
+    shrink_floor: int = 3000,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Make a trajectory fit ``max_seq_len`` without losing the task.
 
-    ``template_owner`` is a processor (Gemma-4) or tokenizer exposing
-    ``apply_chat_template``.
+    The old behaviour sliced ``input_ids[-max_seq_len:]``, which removed the
+    system prompt, tool schemas and the issue text — the model was trained to
+    write fixes for a problem it never saw (AUDIT C4). Instead, in order:
+
+    1. shrink very large observations (> ``shrink_floor`` chars) in the
+       middle, keeping both ends — they usually carry the file view the next
+       edit depends on, so they are trimmed before anything is dropped;
+    2. drop the *oldest* complete assistant/tool turns, always keeping the
+       head (system + first user message = the task) and the final turn;
+    3. shrink any remaining observation down to a small floor;
+    4. report ``hard_truncated`` if it still does not fit.
     """
+    info = {"dropped_turns": 0, "shrunk_messages": 0, "hard_truncated": 0}
+    msgs = [dict(m) for m in messages]
+
+    def fits() -> bool:
+        return len(_render(template_owner, msgs, tools)) <= max_seq_len
+
+    def shrink_largest(floor: int) -> bool:
+        candidates = [
+            (len(m.get("content") or ""), i)
+            for i, m in enumerate(msgs)
+            if m.get("role") in ("tool", "user") and i != len(msgs) - 1
+        ]
+        candidates = [c for c in candidates if c[0] > floor]
+        if not candidates:
+            return False
+        _, index = max(candidates)
+        msgs[index]["content"] = _shrink_text(msgs[index]["content"])
+        info["shrunk_messages"] += 1
+        return True
+
+    if fits():
+        return msgs, info
+
+    for _ in range(16):  # phase 1
+        if fits():
+            return msgs, info
+        if not shrink_largest(shrink_floor):
+            break
+
+    head_end = next((i for i, m in enumerate(msgs) if m.get("role") == "user"), 0)
+    starts = [i for i in range(head_end + 1, len(msgs)) if msgs[i].get("role") == "assistant"]
+    if starts:  # phase 2
+        lengths = _prefix_lengths(template_owner, msgs, tools)
+        total = lengths[-1]
+        chosen = starts[-1]
+        for start in starts:  # ascending: first fit keeps the most history
+            if lengths[head_end] + (total - lengths[start - 1]) <= max_seq_len:
+                chosen = start
+                break
+        if chosen > head_end + 1:
+            info["dropped_turns"] = sum(1 for i in starts if i < chosen)
+            msgs = msgs[: head_end + 1] + msgs[chosen:]
+
+    for _ in range(16):  # phase 3
+        if fits():
+            return msgs, info
+        if not shrink_largest(200):
+            break
+    info["hard_truncated"] = 1
+    return msgs, info
+
+
+def encode_trajectory_ex(
+    template_owner: Any,
+    messages: Sequence[dict[str, Any]],
+    max_seq_len: int,
+    tools: Any = DEFAULT_TOOLS,
+) -> tuple[dict[str, list[int]], dict[str, int]]:
+    """:func:`encode_trajectory` plus a report of what had to be cut."""
     if not messages:
         raise ValueError("trajectory has no messages")
-    messages = deserialize_tool_args(messages)
-    input_ids = as_ids(
-        template_owner.apply_chat_template(
-            list(messages), tokenize=True, add_generation_prompt=False
-        )
-    )
+    tools = _resolve_tools(tools)
+    trainable = [bool(m.get("train", True)) for m in messages]
+    messages = deserialize_tool_args(strip_training_flags(messages))
+    # carry the per-message loss flags through any dropping/shrinking
+    for flag, message in zip(trainable, messages):
+        message["_train"] = flag
+    fitted, info = fit_messages(_StripOwner(template_owner), messages, max_seq_len, tools)
+    flags = [m.pop("_train", True) for m in fitted]
+
+    input_ids = _render(template_owner, fitted, tools)
     if not input_ids:
         raise ValueError("chat template produced no tokens")
 
     labels = [-100] * len(input_ids)
     start = 0
-    for message, end in zip(messages, _prefix_lengths(template_owner, messages)):
+    for message, flag, end in zip(fitted, flags, _prefix_lengths(template_owner, fitted, tools)):
         # clamp: non-concatenative templates can misalign, never go backwards
         end = max(start, min(end, len(input_ids)))
-        if message.get("role") == "assistant":
+        if message.get("role") == "assistant" and flag:
             labels[start:end] = input_ids[start:end]
         start = end
 
@@ -105,11 +214,41 @@ def encode_trajectory(
                 break
 
     if len(input_ids) > max_seq_len:
-        # keep the most recent turns: the edit/test/submit tail matters most
+        # last resort only (reported): keep the most recent tokens
+        info["hard_truncated"] = 1
         input_ids = input_ids[-max_seq_len:]
         labels = labels[-max_seq_len:]
 
-    return {"input_ids": list(input_ids), "labels": list(labels)}
+    return {"input_ids": list(input_ids), "labels": list(labels)}, info
+
+
+class _StripOwner:
+    """Hide the private ``_train`` flag from the chat template."""
+
+    def __init__(self, owner: Any) -> None:
+        self._owner = owner
+
+    def apply_chat_template(self, messages, **kwargs):  # noqa: ANN001, ANN201
+        clean = [{k: v for k, v in m.items() if k != "_train"} for m in messages]
+        return self._owner.apply_chat_template(clean, **kwargs)
+
+
+def encode_trajectory(
+    template_owner: Any,
+    messages: Sequence[dict[str, Any]],
+    max_seq_len: int,
+    tools: Any = DEFAULT_TOOLS,
+) -> dict[str, list[int]]:
+    """Render one trajectory to ``input_ids``/``labels`` with assistant-only loss.
+
+    ``template_owner`` is a processor (Gemma-4) or tokenizer exposing
+    ``apply_chat_template``. Tool schemas are rendered into the prompt
+    (``tools="default"``; pass ``None`` to omit). Over-long trajectories are
+    fitted by :func:`fit_messages` rather than sliced from the front. A
+    message with ``"train": False`` is shown to the model but never trained on.
+    """
+    encoded, _ = encode_trajectory_ex(template_owner, messages, max_seq_len, tools)
+    return encoded
 
 
 def sliced_supervision(labels: Sequence[int]) -> tuple[list[int], list[int]]:

@@ -51,6 +51,23 @@ class Limits:
     def as_dict(self) -> dict[str, int]:
         return asdict(self)
 
+    @classmethod
+    def for_tests(cls, wall_seconds: int = 300) -> "Limits":
+        """Limits for scoring a real project's test suite.
+
+        The 30 s CPU / 2 GiB defaults are right for tiny probes but kill
+        heavyweight suites (Django, sympy) and score the kill as a test
+        failure. CPU is aligned with the wall budget; address space is
+        generous because node/java/numpy reserve large virtual ranges.
+        """
+        wall = int(wall_seconds)
+        return cls(
+            cpu_seconds=wall,
+            address_space_bytes=8 * 1024**3,
+            process_count=256,
+            wall_seconds=wall,
+        )
+
     def supported(self) -> tuple[str, ...]:
         if not IS_POSIX:
             return ("wall_seconds",)

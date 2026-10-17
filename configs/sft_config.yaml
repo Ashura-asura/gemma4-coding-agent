@@ -29,14 +29,16 @@ training:
   learning_rate: 2.0e-4
   lr_scheduler: cosine
   warmup_ratio: 0.03
-  max_seq_len: 2048       # vocab 262144: loss upcasts logits fp32 (~1MB/token) — 2048 fits 16GB T4 (§0.3)
+  max_seq_len: 4096       # compacted data (data/scripts/compact_sft_trajectories.py) targets ~4k tokens. Only supervised rows go
+                          # through the lm_head (sliced loss); if a T4 OOMs, lower to 3072 — over-long examples are *fitted*
+                          # (oldest turns dropped, issue kept), never sliced from the front (AUDIT C4)
   gradient_checkpointing: true
   max_grad_norm: 1.0
   seed: 0
   resume_from: null         # set to adapter dir to resume after a quota timeout (§5)
 
 data:
-  path: data/sft_trajectories.jsonl
+  path: data/sft_trajectories.compact.jsonl   # python -m data.scripts.compact_sft_trajectories (from data/sft_trajectories.jsonl)
   # Loss on model tool-call/reasoning tokens only; prompt + observations masked (§2.4).
 
 output_dir: checkpoints/sft

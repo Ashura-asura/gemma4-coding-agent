@@ -87,7 +87,7 @@ def format_report(summary: dict[str, Any]) -> str:
         f"resolved         : {summary['n_resolved']}",
         f"resolved-rate    : {summary['resolved_rate']:.1%}",
         f"patch validity   : {summary['patch_validity_rate']:.1%}",
-        f"avg steps        : "
+        "avg steps        : "
         + (f"{summary['avg_steps_to_submit']:.1f}" if summary["avg_steps_to_submit"] is not None else "n/a"),
         "",
         "failure modes:",

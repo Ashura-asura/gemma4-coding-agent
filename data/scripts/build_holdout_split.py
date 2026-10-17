@@ -16,7 +16,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import sys
 from pathlib import Path as _Path
 
 # allow `python data/scripts/<this>.py` from a plain checkout

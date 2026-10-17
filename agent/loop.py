@@ -28,6 +28,10 @@ Rules:
 """
 
 
+class MalformedCall(ValueError):
+    """The policy produced text that is not a tool call (recoverable)."""
+
+
 class Policy(Protocol):
     def generate_tool_call(self, context: Context) -> ToolCall | None: ...
 
@@ -82,7 +86,13 @@ def _coerce_call(candidate: Any, context: Context) -> ToolCall:
     if candidate is None:
         raise ValueError("policy returned no tool call")
     if isinstance(candidate, ToolCall):
-        return ToolCall(id=call_id, name=candidate.name, arguments=candidate.arguments)
+        return ToolCall(
+            id=call_id,
+            name=candidate.name,
+            arguments=candidate.arguments,
+            reasoning=candidate.reasoning,
+            completion_ids=candidate.completion_ids,
+        )
     if isinstance(candidate, tuple) and len(candidate) == 2:
         return ToolCall(id=call_id, name=candidate[0], arguments=candidate[1])
     if isinstance(candidate, dict):
@@ -116,6 +126,7 @@ def run_episode(
     repo_state: str = "",
     max_steps: int = 30,
     system_prompt: str = SYSTEM_PROMPT,
+    max_malformed: int = 2,
 ) -> EpisodeResult:
     """Execute one episode. Always returns a typed result (§2.3 spirit)."""
     if max_steps < 1:
@@ -135,6 +146,18 @@ def run_episode(
     for _ in range(max_steps):
         try:
             raw_call = policy.generate_tool_call(context)
+        except MalformedCall as exc:
+            # a format slip is recoverable: tell the model and let it retry,
+            # up to max_malformed times per episode (it still costs a step)
+            context.malformed += 1
+            if context.malformed > max_malformed:
+                status, error = "error", f"unusable policy output: {exc}"
+                break
+            context.add_note(
+                "error: your last output was not a valid tool call. Reply with exactly "
+                "one tool call using the listed tools and their exact arguments."
+            )
+            continue
         except Exception as exc:  # a crashing policy must not lose the episode record
             status, error = "error", f"policy raised {type(exc).__name__}: {exc}"
             break

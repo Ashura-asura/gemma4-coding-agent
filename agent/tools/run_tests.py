@@ -15,7 +15,7 @@ from . import BaseTool, ToolError
 
 DEFAULT_TEST_COMMAND: tuple[str, ...] = (sys.executable, "-m", "pytest", "-q")
 TEST_TIMEOUT_S = 300.0
-MAX_OUTPUT_CHARS = 8000
+MAX_OUTPUT_CHARS = 3000
 
 
 class RunTests(BaseTool):

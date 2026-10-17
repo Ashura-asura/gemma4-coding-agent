@@ -11,30 +11,36 @@ Task record (one JSON object per line, e.g. ``data/holdout_tasks.jsonl``)::
      "test_target": "tests/test_x.py"}   # optional
 
 Scoring: the submitted patch is applied to a *fresh* copy of the checkout
-and the task's tests are run there. A model therefore cannot score by
-editing or deleting its own tests — the primary reward (§2.5) always comes
-from an untouched tree.
+and the task's tests are run there. Sections of the patch that touch test or
+harness files are dropped first (``eval.scoring_guard``), and an exit code
+alone is never trusted: the run must have executed and passed at least one
+test with nothing skipped. A model therefore cannot score by editing,
+skipping or deleting its own tests.
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import shutil
 import sys
 import tempfile
 import time
+import tokenize
 from pathlib import Path
 from typing import Any, Callable
 
 import yaml
 
 from agent.context import ToolCall
-from agent.loop import Policy, ScriptedPolicy, run_episode
-from agent.tools import ToolEnv, build_toolset
+from agent.gemma_format import ToolCallParseError, clean_reasoning, extract_tool_call
+from agent.loop import MalformedCall, Policy, ScriptedPolicy, run_episode
+from agent.tools import ToolEnv, build_toolset, default_tool_specs
 from agent.tools.edit_file import PatchError, apply_patch_to_tree, split_multifile_patch
-from agent.tools.run_tests import DEFAULT_TEST_COMMAND, TEST_TIMEOUT_S
+from agent.tools.run_tests import TEST_TIMEOUT_S
 from eval.report import format_report, summarize
+from eval.scoring_guard import is_infra_kill, sanitize_patch, verify_outcome
 from sandbox import Limits, Sandbox
 
 __all__ = [
@@ -179,31 +185,27 @@ def score_submission(
     """Apply the task's test patch *and* the submitted patch to a fresh
     checkout, then run the task's tests there (§2.5 primary reward source)."""
     if not patch or not patch.strip():
-        return {
-            "patch_valid": False,
-            "resolved": False,
-            "test_status": "error",
-            "reason": "empty or missing patch",
-        }
+        return _fail("empty or missing patch")
+
+    test_patch = str(task.get("test_patch") or "")
+    try:
+        patch, dropped = sanitize_patch(patch, test_patch)
+    except Exception as exc:  # noqa: BLE001 - malformed diff text
+        return _fail(f"patch is not a valid diff: {type(exc).__name__}: {exc}")
+    if not patch:
+        return _fail(
+            "patch touched no non-test files",
+            dropped_protected=dropped,
+        )
 
     env_error = ensure_task_environment(task)
     if env_error:
-        return {
-            "patch_valid": False,
-            "resolved": False,
-            "test_status": "error",
-            "reason": env_error,
-        }
+        return _fail(env_error, infra=True)
 
     try:
         repo = materialize_repo(task)
     except Exception as exc:  # noqa: BLE001 - surfaced as a typed eval error
-        return {
-            "patch_valid": False,
-            "resolved": False,
-            "test_status": "error",
-            "reason": f"checkout failed: {type(exc).__name__}: {exc}",
-        }
+        return _fail(f"checkout failed: {type(exc).__name__}: {exc}", infra=True)
 
     from data.scripts.common import prepare_checkout, pythonpath_for
 
@@ -211,74 +213,143 @@ def score_submission(
         fresh = Path(tmp) / "repo"
         shutil.copytree(repo, fresh)
 
-        test_patch = str(task.get("test_patch") or "")
         if test_patch:
             try:
                 apply_patch_to_tree(test_patch, fresh)
             except PatchError as exc:
-                return {
-                    "patch_valid": False,
-                    "resolved": False,
-                    "test_status": "error",
-                    "reason": f"task test patch does not apply: {exc}",
-                }
+                return _fail(f"task test patch does not apply: {exc}", infra=True)
 
         try:
             applied = apply_patch_to_tree(patch, fresh)
         except PatchError as exc:
-            return {
-                "patch_valid": False,
-                "resolved": False,
-                "test_status": "error",
-                "reason": f"patch does not apply: {exc}",
-            }
+            return _fail(f"patch does not apply: {exc}", dropped_protected=dropped)
         if not applied:
-            return {
-                "patch_valid": False,
-                "resolved": False,
-                "test_status": "error",
-                "reason": "patch touched no files",
-            }
+            return _fail("patch touched no files", dropped_protected=dropped)
+        if not _changes_code(repo, fresh, applied):
+            return _fail("patch is a no-op (whitespace or comments only)", dropped_protected=dropped)
 
         project = task_project(task)
         if project:
             try:
                 prepare_checkout(project, fresh)
             except Exception as exc:  # noqa: BLE001
-                return {
-                    "patch_valid": False,
-                    "resolved": False,
-                    "test_status": "error",
-                    "reason": f"checkout prep failed: {type(exc).__name__}: {exc}",
-                }
+                return _fail(f"checkout prep failed: {type(exc).__name__}: {exc}", infra=True)
 
         base, targets = task_test_config(task)
         runner = str(task.get("test_runner", "pytest"))
+        # regression guard: pass-to-pass targets, when the record carries them
+        extra = [str(t) for t in (task.get("p2p_targets") or []) if str(t) not in targets]
+        if extra:
+            targets = targets + extra
         if not targets and runner != "pytest":
             return {
                 "patch_valid": True,
                 "resolved": False,
                 "test_status": "error",
+                "infra_error": True,
                 "reason": "task defines no test targets",
             }
 
-        sandbox = Sandbox(fresh, limits=limits)
+        junit_path = fresh / ".score_junit.xml"
+        if runner != "django":
+            base = base + [f"--junitxml={junit_path}", "-p", "no:cacheprovider"]
+
+        run_limits = limits if limits is not None else Limits.for_tests(int(test_timeout))
+        sandbox = Sandbox(fresh, limits=run_limits)
         result = sandbox.run(base + targets, timeout=test_timeout, pythonpath=pythonpath_for(fresh))
+        output = result.stdout + "\n" + result.stderr
+
+        infra = is_infra_kill(result.returncode, result.status, result.message)
+        resolved, reason = False, result.message
+        if result.status == "pass":
+            junit_text = None
+            if junit_path.exists():
+                junit_text = junit_path.read_text(encoding="utf-8", errors="replace")
+            resolved, reason = verify_outcome(runner, output, junit_xml=junit_text)
         return {
             "patch_valid": True,
-            "resolved": result.status == "pass",
-            "test_status": result.status,
-            "test_output": (result.stdout + "\n" + result.stderr)[-4000:],
+            "resolved": resolved,
+            "test_status": result.status if not (result.status == "pass" and not resolved) else "fail",
+            "infra_error": bool(infra and not resolved),
+            "test_output": output[-4000:],
             "applied_files": applied,
+            "dropped_protected": dropped,
             "isolation": result.isolation,
             "warnings": list(result.warnings),
-            "reason": "tests passed" if result.status == "pass" else result.message,
+            "reason": reason,
         }
+
+
+def _fail(reason: str, *, infra: bool = False, **extra: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "patch_valid": False,
+        "resolved": False,
+        "test_status": "error",
+        "infra_error": infra,
+        "reason": reason,
+    }
+    out.update(extra)
+    return out
+
+
+_COMMENT_OR_BLANK = re.compile(r"^\s*(#.*)?$")
+_IGNORED_TOKENS = {
+    tokenize.COMMENT,
+    tokenize.NL,
+    tokenize.NEWLINE,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.ENDMARKER,
+}
+
+
+def _code_signature(text: str) -> list[Any]:
+    """Token stream without comments/whitespace; line-based fallback if it
+    does not tokenize (e.g. a half-edited file)."""
+    try:
+        return [
+            (tok.type, tok.string)
+            for tok in tokenize.generate_tokens(io.StringIO(text).readline)
+            if tok.type not in _IGNORED_TOKENS
+        ]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return [" ".join(row.split()) for row in text.splitlines() if not _COMMENT_OR_BLANK.match(row)]
+
+
+def _changes_code(original_root: Path, patched_root: Path, applied: list[str]) -> bool:
+    """False when every touched file differs only by whitespace/comments."""
+    for rel in applied:
+        new = patched_root / rel
+        old = original_root / rel
+        new_text = new.read_text(encoding="utf-8", errors="replace") if new.exists() else ""
+        old_text = old.read_text(encoding="utf-8", errors="replace") if old.exists() else ""
+        if not rel.endswith(".py"):
+            if new_text != old_text:
+                return True
+            continue
+        if _code_signature(new_text) != _code_signature(old_text):
+            return True
+    return False
 
 
 # ------------------------------------------------------------------ policies
 def parse_tool_call(text: str) -> ToolCall:
-    """Pull a tool call out of a raw model completion."""
+    """Pull a tool call out of a raw model completion.
+
+    Gemma 4's native ``<|tool_call>call:name{...}<tool_call|>`` form is tried
+    first (that is what a model trained on the chat template emits); bare
+    JSON tool calls remain supported for zero-shot / other chat templates.
+    Raises :class:`MalformedCall` (a ``ValueError``) when nothing parses.
+    """
+    try:
+        name, arguments, reasoning = extract_tool_call(text)
+        return ToolCall(id="call_0", name=name, arguments=arguments, reasoning=reasoning)
+    except ToolCallParseError:
+        pass
+    return _parse_json_tool_call(text)
+
+
+def _parse_json_tool_call(text: str) -> ToolCall:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     candidates = [fenced.group(1)] if fenced else []
     decoder = json.JSONDecoder()
@@ -310,8 +381,10 @@ def parse_tool_call(text: str) -> ToolCall:
             except ValueError:
                 continue
         if name and isinstance(arguments, dict):
-            return ToolCall(id="call_0", name=str(name), arguments=arguments)
-    raise ValueError(f"no tool call found in model output: {text[:200]!r}")
+            cut = text.find(candidate)
+            reasoning = clean_reasoning(text[:cut]) if cut > 0 else ""
+            return ToolCall(id="call_0", name=str(name), arguments=arguments, reasoning=reasoning)
+    raise MalformedCall(f"no tool call found in model output: {text[:200]!r}")
 
 
 class HFPolicy:
@@ -363,13 +436,15 @@ class HFPolicy:
                 ),
                 "device_map": "auto",
             }
-        is_adapter = (Path(model_path) / "adapter_config.json").exists()
-        if is_adapter:
+        from train.rl.checkpoints import resolve_adapter_dir
+
+        adapter_dir = resolve_adapter_dir(model_path)
+        if adapter_dir is not None:
             from peft import PeftConfig, PeftModel
 
-            peft_cfg = PeftConfig.from_pretrained(model_path)
+            peft_cfg = PeftConfig.from_pretrained(str(adapter_dir))
             base = AutoModelForCausalLM.from_pretrained(peft_cfg.base_model_name_or_path, **kwargs)
-            self.model = PeftModel.from_pretrained(base, model_path)
+            self.model = PeftModel.from_pretrained(base, str(adapter_dir))
         else:
             self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
         if torch.cuda.is_available() and not self._quantized:
@@ -378,19 +453,43 @@ class HFPolicy:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
 
-    def generate_tool_call(self, context) -> ToolCall:  # type: ignore[no-untyped-def]
+    def _stop_ids(self) -> set[int]:
+        ids: set[int] = set()
+        eos = getattr(self.tokenizer, "eos_token_id", None)
+        if isinstance(eos, int):
+            ids.add(eos)
+        elif isinstance(eos, (list, tuple)):
+            ids.update(int(i) for i in eos)
+        unk = getattr(self.tokenizer, "unk_token_id", None)
+        for token in ("<turn|>", "<end_of_turn>", "<tool_call|>"):
+            try:
+                tid = self.tokenizer.convert_tokens_to_ids(token)
+            except Exception:  # noqa: BLE001 - tokenizers differ
+                continue
+            if isinstance(tid, int) and tid >= 0 and tid != unk:
+                ids.add(tid)
+        return ids
+
+    def build_prompt(self, context) -> str:  # type: ignore[no-untyped-def]
+        """Chat-template prompt for ``context`` incl. tool schemas (AUDIT C3)."""
         from train.sft.data_collator import deserialize_tool_args
 
         # Gemma-4's template validates tool arguments as JSON objects; our
         # messages carry them as strings (same as the stored trajectories)
         messages = deserialize_tool_args(context.messages)
         if getattr(self.tokenizer, "chat_template", None):
-            prompt = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tools=default_tool_specs(),
+                tokenize=False,
+                add_generation_prompt=True,
             )
-        else:
-            prompt = context.render_flat()
-        inputs = self.tokenizer(prompt, return_tensors="pt")
+        return context.render_flat()
+
+    def generate_tool_call(self, context) -> ToolCall:  # type: ignore[no-untyped-def]
+        prompt = self.build_prompt(context)
+        # the template already contains <bos>; adding it again degrades output
+        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         with self._torch.no_grad():
             output = self.model.generate(
@@ -399,11 +498,20 @@ class HFPolicy:
                 do_sample=self.temperature > 0,
                 temperature=max(self.temperature, 1e-5),
                 pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=sorted(self._stop_ids()) or None,
             )
-        text = self.tokenizer.decode(
-            output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        )
-        return parse_tool_call(text)
+        generated = output[0][inputs["input_ids"].shape[1]:].tolist()
+        stops = self._stop_ids()
+        for index, token_id in enumerate(generated):
+            if token_id in stops:
+                generated = generated[: index + 1]
+                break
+        # keep special tokens: the native tool-call delimiters are special
+        # tokens and skipping them (the old behaviour) destroyed the format
+        text = self.tokenizer.decode(generated, skip_special_tokens=False)
+        call = parse_tool_call(text)  # raises MalformedCall: the loop retries (AUDIT C3)
+        call.completion_ids = generated
+        return call
 
 
 def build_policy_factory(name: str, args: argparse.Namespace) -> Callable[[dict[str, Any]], Policy]:
@@ -493,7 +601,7 @@ def evaluate_task(
                 record["reason"] = record["error"]
                 return record
 
-        sandbox = Sandbox(workdir, limits=limits)
+        sandbox = Sandbox(workdir, limits=limits or Limits.for_tests(int(TEST_TIMEOUT_S)))
         env = ToolEnv(
             sandbox=sandbox,
             test_base=base,
@@ -557,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
     tasks_path = args.tasks or config.get("holdout_path") or "data/holdout_tasks.jsonl"
     rollout_cfg = config.get("rollout", {}) or {}
     max_steps = args.max_steps or int(rollout_cfg.get("max_steps", DEFAULT_MAX_STEPS))
-    limits = Limits(wall_seconds=int(rollout_cfg.get("wall_seconds", 600)))
+    limits = Limits.for_tests(int(rollout_cfg.get("wall_seconds", 600)))
     model = args.model or config.get("model_checkpoint")
     if args.policy == "hf" and not model:
         raise SystemExit("--policy hf requires --model or model_checkpoint in the config")

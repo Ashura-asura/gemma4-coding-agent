@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 
@@ -11,6 +11,11 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    #: prose the model wrote before the call; kept in the history so the
+    #: context matches what the SFT data (and the model) actually contain
+    reasoning: str = ""
+    #: the exact sampled token ids (RL needs the real samples, not a re-render)
+    completion_ids: list[int] | None = None
 
     @classmethod
     def make(cls, name: str, arguments: dict[str, Any], call_id: str | None = None) -> "ToolCall":
@@ -49,6 +54,7 @@ class Context:
 
     def __init__(self, system: str = "", user: str = "") -> None:
         self.messages: list[dict[str, Any]] = []
+        self.malformed: int = 0
         self.tool_calls: list[ToolCall] = []
         self.observations: list[Observation] = []
         if system:
@@ -62,6 +68,7 @@ class Context:
         return len(self.observations)
 
     def add_assistant(self, call: ToolCall, reasoning: str = "") -> None:
+        reasoning = reasoning or call.reasoning
         message: dict[str, Any] = {
             "role": "assistant",
             "content": reasoning or None,
@@ -108,7 +115,14 @@ class Context:
             "messages": self.messages,
             "steps": self.steps,
             "tool_calls": [
-                {"id": c.id, "name": c.name, "arguments": c.arguments} for c in self.tool_calls
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "arguments": c.arguments,
+                    **({"reasoning": c.reasoning} if c.reasoning else {}),
+                    **({"completion_ids": c.completion_ids} if c.completion_ids else {}),
+                }
+                for c in self.tool_calls
             ],
             "observations": [
                 {
@@ -126,7 +140,13 @@ class Context:
         ctx = cls()
         ctx.messages = list(data.get("messages", []))
         ctx.tool_calls = [
-            ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+            ToolCall(
+                id=c["id"],
+                name=c["name"],
+                arguments=c["arguments"],
+                reasoning=c.get("reasoning", ""),
+                completion_ids=c.get("completion_ids"),
+            )
             for c in data.get("tool_calls", [])
         ]
         ctx.observations = [

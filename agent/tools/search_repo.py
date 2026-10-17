@@ -6,7 +6,6 @@ nothing to inject into and the allowlist stays small.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
 from . import BaseTool, ToolError
@@ -17,7 +16,7 @@ SKIP_DIRS = {
     "dist", "build", ".idea", ".vscode",
 }
 MAX_FILE_BYTES = 1_000_000
-DEFAULT_MAX_RESULTS = 50
+DEFAULT_MAX_RESULTS = 25
 MAX_RESULTS_CAP = 200
 
 

@@ -22,7 +22,7 @@ from typing import Any, Callable
 import yaml
 
 from eval.run_eval import evaluate_task
-from train.rl.reward import episode_reward, group_normalize, reward_weights
+from train.rl.reward import effective_rewards, episode_reward, group_advantages, reward_weights
 
 
 def load_pending(pool_path: Path, out_path: Path, limit: int | None) -> list[dict[str, Any]]:
@@ -53,6 +53,8 @@ def rollout_task(
     limits: Any,
     weights: dict[str, float],
     evaluate: Callable[..., dict[str, Any]] = evaluate_task,
+    shaping: str = "gated",
+    scale_by_std: bool = False,
 ) -> dict[str, Any]:
     """k trajectories for one task, scored + group-normalized (§3.3)."""
     rollouts: list[dict[str, Any]] = []
@@ -66,6 +68,7 @@ def rollout_task(
             "resolved": record.get("resolved"),
             "test_status": record.get("test_status"),
             "reason": record.get("reason"),
+            "infra_error": record.get("infra_error"),
         }
         reward = episode_reward(
             task,
@@ -84,6 +87,10 @@ def rollout_task(
                 "submitted": submitted,
                 "resolved": reward["resolved"],
                 "patch_valid": reward["patch_valid"],
+                "infra_error": reward["infra_error"],
+                "completions": [
+                    c.get("completion_ids") for c in (trajectory.get("tool_calls") or [])
+                ],
                 "patch": record.get("submitted_patch"),
                 "reward": reward["reward"],
                 "components": reward["components"],
@@ -91,8 +98,17 @@ def rollout_task(
                 "duration_s": record.get("duration_s"),
             }
         )
-    normalized = group_normalize([r["reward"] for r in rollouts])
-    for rollout, value in zip(rollouts, normalized):
+    training_rewards = effective_rewards(
+        [r["components"] for r in rollouts],
+        [r["resolved"] for r in rollouts],
+        [r["infra_error"] for r in rollouts],
+        shaping=shaping,
+    )
+    normalized = group_advantages(
+        training_rewards, [r["infra_error"] for r in rollouts], scale_by_std=scale_by_std
+    )
+    for rollout, tr, value in zip(rollouts, training_rewards, normalized):
+        rollout["training_reward"] = tr
         rollout["normalized"] = value
     return {
         "task_id": task["task_id"],
@@ -128,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     from eval.run_eval import Limits, HFPolicy
     from agent.loop import ScriptedPolicy
 
-    limits = Limits(wall_seconds=int(rollout_cfg.get("wall_seconds", 600)))
+    limits = Limits.for_tests(int(rollout_cfg.get("wall_seconds", 600)))
     weights = reward_weights(config)
     out_path = Path(args.out)
     pool_path = Path(rollout_cfg.get("task_pool") or "data/rl_task_pool.jsonl")

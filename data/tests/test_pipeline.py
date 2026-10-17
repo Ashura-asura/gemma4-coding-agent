@@ -11,7 +11,6 @@ import pytest
 from data.scripts import build_holdout_split, build_rl_task_pool, build_sft_trajectories
 from data.scripts import common
 from data.scripts.common import (
-    ensure_verified,
     jsonl_read,
     jsonl_write,
     normalise_instance,
@@ -341,3 +340,53 @@ def test_build_sft_replays_only_verified_sft_split(
     replayed.clear()
     assert build_sft_trajectories.main(["--parquet", str(tiny_parquet)]) == 0
     assert replayed == []
+
+
+# ------------------------------------------------------------------ compaction (AUDIT C4/H5)
+def _traj():
+    numbered = "\n".join(f"{i:>4}: line_{i} = {i}" for i in range(1, 301))
+    diff = "--- a/m.py\n+++ b/m.py\n@@ -150,3 +150,3 @@\n line_150 = 150\n-line_151 = 151\n+line_151 = 0\n line_152 = 152\n"
+    return {
+        "task_id": "t",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Issue:\nfix it"},
+            {"role": "assistant", "content": "read", "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": "m.py"})}}]},
+            {"role": "tool", "tool_call_id": "c0", "name": "read_file", "content": numbered, "is_error": False},
+            {"role": "assistant", "content": "edit", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "edit_file", "arguments": json.dumps({"path": "m.py", "diff": diff})}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "edit_file", "content": "applied patch to m.py (300 -> 300 lines)", "is_error": False},
+            {"role": "assistant", "content": "done", "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "submit", "arguments": json.dumps({"patch": "diff --git ..."})}}]},
+            {"role": "tool", "tool_call_id": "c2", "name": "submit", "content": "submitted patch (99 chars); episode complete", "is_error": False},
+        ],
+        "meta": {},
+    }
+
+
+def test_compaction_windows_reads_and_drops_the_retyped_patch():
+    import random
+
+    from data.scripts.compact_sft_trajectories import compact
+
+    out = compact(_traj(), rng=random.Random(0), recovery_rate=0.0)
+    read_call = json.loads(out["messages"][2]["tool_calls"][0]["function"]["arguments"])
+    assert read_call == {"path": "m.py", "start_line": 110, "end_line": 192}
+    obs = out["messages"][3]["content"].splitlines()
+    assert obs[0].strip().startswith("110: line_110") and obs[-1].strip().startswith("192: line_192")
+    assert out["messages"][6]["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert out["meta"]["compacted"] is True
+
+
+def test_recovery_example_masks_the_bad_call_and_keeps_the_good_one():
+    import random
+
+    from data.scripts.compact_sft_trajectories import compact
+
+    out = compact(_traj(), rng=random.Random(0), recovery_rate=1.0)
+    msgs = out["messages"]
+    bad = [m for m in msgs if m.get("train") is False]
+    assert len(bad) == 1 and bad[0]["role"] == "assistant"
+    errors = [m for m in msgs if m["role"] == "tool" and m.get("is_error")]
+    assert errors and errors[0]["content"].startswith("error:")
+    good_edits = [m for m in msgs if m["role"] == "assistant" and m.get("train") is None
+                  and m["tool_calls"][0]["function"]["name"] == "edit_file"]
+    assert len(good_edits) == 1

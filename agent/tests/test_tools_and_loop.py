@@ -1,7 +1,6 @@
 """Tool interface + agent loop tests — ARCHITECTURE.md §2.2."""
 from __future__ import annotations
 
-import sys
 
 import pytest
 
@@ -288,3 +287,64 @@ def test_context_round_trip():
     assert restored.tool_calls[0].name == "read_file"
     assert "[tool read_file] contents" in restored.render_flat()
     assert restored.estimate_tokens() > 0
+
+
+# ------------------------------------------------- audit: bounded tool output / auto-submit
+def test_read_file_without_range_is_windowed(tmp_path):
+    from agent.tools.read_file import DEFAULT_WINDOW
+
+    (tmp_path / "big.py").write_text("\n".join(f"x{i} = {i}" for i in range(1, 1001)) + "\n")
+    env = ToolEnv(sandbox=Sandbox(tmp_path))
+    tools = build_toolset(env)
+    out = tools["read_file"].execute({"path": "big.py"})
+    assert out.splitlines()[0].strip().startswith("1: x1")
+    assert f"showing lines 1-{DEFAULT_WINDOW} of 1000" in out
+    ranged = tools["read_file"].execute({"path": "big.py", "start_line": 500, "end_line": 502})
+    assert [row.split(":")[0].strip() for row in ranged.splitlines()] == ["500", "501", "502"]
+
+
+def test_submit_without_patch_uses_the_workspace_diff(tmp_path):
+    import subprocess
+
+    def git(*a):
+        subprocess.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "m.py").write_text("a = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    env = ToolEnv(sandbox=Sandbox(tmp_path))
+    tools = build_toolset(env)
+    with pytest.raises(ToolError, match="nothing to submit"):
+        tools["submit"].execute({})
+    (tmp_path / "m.py").write_text("a = 2\n")
+    (tmp_path / "new.py").write_text("b = 1\n")
+    result = tools["submit"].execute({})
+    assert "episode complete" in result
+    assert "-a = 1" in env.submitted_patch and "+a = 2" in env.submitted_patch
+    assert "new.py" in env.submitted_patch
+
+
+def test_submit_diff_ignores_scratch_and_cache_paths(tmp_path):
+    import subprocess
+
+    def git(*a):
+        subprocess.run(["git", *a], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "m.py").write_text("a = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    (tmp_path / ".sandbox-tmp").mkdir()
+    (tmp_path / ".sandbox-tmp" / "junk").write_text("x")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\0")
+    (tmp_path / "m.py").write_text("a = 2\n")
+    env = ToolEnv(sandbox=Sandbox(tmp_path))
+    build_toolset(env)["submit"].execute({})
+    assert "m.py" in env.submitted_patch
+    assert ".sandbox-tmp" not in env.submitted_patch and "pyc" not in env.submitted_patch

@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from train.sft.data_collator import TrajectoryCollator, as_ids, encode_trajectory, sliced_supervision
+from train.sft.data_collator import TrajectoryCollator, as_ids, encode_trajectory, sliced_supervision  # noqa: E402
 
 
 class FakeTokenizer:
@@ -20,7 +20,7 @@ class FakeTokenizer:
             for m in messages
         )
 
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, tools=None):
         text = self._render(messages)
         # one id per character (deterministic, order-preserving)
         ids = [ord(c) % 30000 + 2 for c in text]
@@ -61,12 +61,12 @@ def test_assistant_spans_unmasked_others_masked():
     assert any(label != -100 for label in labels)
 
 
-def test_left_truncation_keeps_tail():
+def test_over_long_trajectory_is_fitted_and_keeps_supervision():
     tok = FakeTokenizer()
-    enc = encode_trajectory(tok, MESSAGES, max_seq_len=40)
-    assert len(enc["input_ids"]) == 40
-    assert len(enc["labels"]) == 40
-    # the final (submit) assistant turn survives truncation
+    enc = encode_trajectory(tok, MESSAGES, max_seq_len=60, tools=None)
+    assert len(enc["input_ids"]) <= 60
+    assert len(enc["labels"]) == len(enc["input_ids"])
+    # the final (submit) assistant turn survives
     assert any(label != -100 for label in enc["labels"])
 
 
