@@ -133,6 +133,13 @@ def build_dataset(path: str, processor: Any, config: dict[str, Any]):
     records = [record for record in records if len(record.get("messages") or []) >= 2]
     if not records:
         raise SystemExit(f"no trajectories in {path} — finish the data build first (§2.1)")
+    # Dataset.from_list columnarizes messages: a key that only some messages
+    # carry is returned as None, and bool(None) is False — without this the
+    # Arrow round-trip masked every unflagged turn (v19 trained on 1 token/record).
+    for record in records:
+        for message in record["messages"]:
+            flag = message.get("train")
+            message["train"] = True if flag is None else bool(flag)
     max_seq_len = int(config["training"]["max_seq_len"])
 
     def _encode(record: dict[str, Any]) -> dict[str, Any]:
@@ -501,13 +508,22 @@ def main(argv: list[str] | None = None) -> None:
             inner.pad_token = inner.eos_token
         dataset = build_dataset(config["data"]["path"], processor, config)
         sample = dataset[0]
-        trained = sum(1 for label in sample["labels"] if label != -100)
+        trained0 = sum(1 for label in sample["labels"] if label != -100)
+        counts = sorted(sum(1 for label in row if label != -100) for row in dataset["labels"])
+        n = len(counts)
         print(
-            f"[sft] dry-run OK: {len(dataset)} trajectories, "
-            f"sample tokens={len(sample['input_ids'])}, trained={trained} "
-            f"({trained / max(1, len(sample['labels'])):.0%} unmasked)",
+            f"[sft] dry-run OK: {n} trajectories, sample tokens={len(sample['input_ids'])}, "
+            f"sample trained={trained0}, trained/record min={counts[0]} "
+            f"p50={counts[n // 2]} max={counts[-1]}",
             flush=True,
         )
+        if counts[0] < 32:
+            # the all-masked fallback unmasks exactly 1 token — a near-empty
+            # minimum means masking collapsed for at least one record
+            raise SystemExit(
+                f"[sft] dry-run FAIL: minimum supervision {counts[0]} tokens/record "
+                "(<32) — masking collapsed; check train-flag handling / chat template"
+            )
         return
 
     train(args.config, resume=args.resume, base_override=args.base_model)

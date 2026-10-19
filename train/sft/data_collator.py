@@ -174,6 +174,17 @@ def fit_messages(
     return msgs, info
 
 
+def _train_flag(message: dict[str, Any]) -> bool:
+    """``train`` flag with absence semantics: missing/None = train.
+
+    Arrow fills keys that some records lack with ``None`` (not absence) when
+    dicts are columnarized — ``bool(None)`` is ``False``, which would mask
+    every unflagged turn. Only an explicit ``False`` masks.
+    """
+    flag = message.get("train")
+    return True if flag is None else bool(flag)
+
+
 def encode_trajectory_ex(
     template_owner: Any,
     messages: Sequence[dict[str, Any]],
@@ -184,7 +195,7 @@ def encode_trajectory_ex(
     if not messages:
         raise ValueError("trajectory has no messages")
     tools = _resolve_tools(tools)
-    trainable = [bool(m.get("train", True)) for m in messages]
+    trainable = [_train_flag(m) for m in messages]
     messages = deserialize_tool_args(strip_training_flags(messages))
     # carry the per-message loss flags through any dropping/shrinking
     for flag, message in zip(trainable, messages):

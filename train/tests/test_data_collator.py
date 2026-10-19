@@ -152,3 +152,48 @@ def test_collator_omits_sliced_keys_when_no_targets():
     ])
     assert "logits_to_keep" not in batch
     assert "shift_labels" not in batch
+
+
+def test_train_flag_none_from_arrow_still_trains():
+    # Dataset.from_list fills a key that only some messages carry with None;
+    # bool(None)=False masked every unflagged turn (v19 trained on the
+    # 1-token all-masked fallback). None must mean "absent" -> train.
+    msgs = [dict(m, train=None) for m in MESSAGES]
+    enc = encode_trajectory(FakeTokenizer(), msgs, max_seq_len=4096)
+    supervised = sum(1 for label in enc["labels"] if label != -100)
+    assert supervised > 32, f"supervision collapsed to {supervised} tokens"
+
+
+def test_explicit_false_still_masks():
+    msgs = [dict(m) for m in MESSAGES]
+    msgs[4]["train"] = False  # final submit turn: shown, never trained on
+    full = encode_trajectory(FakeTokenizer(), MESSAGES, max_seq_len=4096)
+    masked = encode_trajectory(FakeTokenizer(), msgs, max_seq_len=4096)
+    n_full = sum(1 for label in full["labels"] if label != -100)
+    n_masked = sum(1 for label in masked["labels"] if label != -100)
+    assert 0 < n_masked < n_full
+
+
+def test_build_dataset_normalizes_train_flags(tmp_path):
+    import json
+
+    from train.sft.trainer import build_dataset
+
+    path = tmp_path / "mini.jsonl"
+    rows = []
+    for i in range(4):
+        messages = [dict(m) for m in MESSAGES]
+        if i % 2 == 0:
+            messages[4]["train"] = False  # explicit mask, H1-style
+        rows.append(json.dumps({"messages": messages}))
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    dataset = build_dataset(str(path), FakeTokenizer(), {"training": {"max_seq_len": 4096}})
+    counts = [sum(1 for label in row["labels"] if label != -100) for row in dataset]
+    # unflagged records train every assistant turn
+    assert counts[1] > 32, f"record 1 collapsed to {counts[1]} tokens"
+    assert counts[1] == counts[3]
+    # explicitly-masked records still supervise their other assistant turn
+    # (only a total collapse would fall back to the 1-token all-masked case)
+    for index in (0, 2):
+        assert 0 < counts[index] < counts[1], f"record {index}: {counts[index]}"
