@@ -238,7 +238,7 @@ def _ce_chunk(logits_chunk: Any, targets: Any) -> Any:
     return F.cross_entropy(logits_chunk.float(), targets, ignore_index=-100, reduction="sum")
 
 
-def chunked_sliced_ce(logits: Any, shift_labels: Any, chunk: int = 512) -> Any:
+def chunked_sliced_ce(logits: Any, shift_labels: Any, chunk: int = 128) -> Any:
     """Mean CE over the supervised rows, computed in row-chunks under
     non-reentrant checkpointing.
 
@@ -246,9 +246,15 @@ def chunked_sliced_ce(logits: Any, shift_labels: Any, chunk: int = 512) -> Any:
     (cast + log-softmax + grad): at seq_len 2048 with a high-K sample that
     peaked past 4 GiB and OOM'd kernel v16 (alloc 14.22 GiB, next request
     1.58 GiB = fp32 [1620, 262144] exactly). Chunking under checkpoint
-    keeps only the fp16 logits plus one chunk's fp32 working set (~1 GiB)
-    regardless of K, while staying numerically equal to
-    transformers' ForCausalLMLoss (mean over non-ignored targets).
+    keeps only the logits plus one chunk's fp32 working set regardless of
+    K, while staying numerically equal to transformers' ForCausalLMLoss
+    (mean over non-ignored targets).
+
+    Default chunk 128 (not 512): the backward recompute asks for exactly
+    chunk × 262144 × 4 B, and kernel v20 (max_seq_len 4096, healthy
+    K=375, loss 1.70) OOM'd on that 512 MiB request at alloc 13.92/14.56
+    GiB. 128 rows = 128 MiB transient, leaving room for the LoRA grad
+    buffers that land right after.
     """
     from torch.utils.checkpoint import checkpoint
     import torch
@@ -437,7 +443,8 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
     keep = sample.get("logits_to_keep")
     print(
         f"[sft] batch keys={sorted(sample)} K={keep.numel() if keep is not None else 'FULL'} | "
-        f"gradient_checkpointing={trainer.model.is_gradient_checkpointing} | "
+        f"gc_requested={trainer.args.gradient_checkpointing} (Trainer enables it at train() start; "
+        f"step0 prints the live ckpt= flag) | "
         f"attn={getattr(getattr(trainer.model, 'config', None), '_attn_implementation', '?')} | "
         f"cuda alloc={torch.cuda.memory_allocated() / 2**30:.2f}GiB "
         f"reserved={torch.cuda.memory_reserved() / 2**30:.2f}GiB",

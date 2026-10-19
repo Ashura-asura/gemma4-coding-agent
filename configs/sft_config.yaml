@@ -31,7 +31,9 @@ training:
   warmup_ratio: 0.03
   max_seq_len: 4096       # compacted data (data/scripts/compact_sft_trajectories.py) targets ~4k tokens. Only supervised rows go
                           # through the lm_head (sliced loss); if a T4 OOMs, lower to 3072 — over-long examples are *fitted*
-                          # (oldest turns dropped, issue kept), never sliced from the front (AUDIT C4)
+                          # (oldest turns dropped, issue kept), never sliced from the front (AUDIT C4). NOTE: 3072 was tried
+                          # after the v20 OOM and the dry-run gate FAILED (min supervision 19 tokens — fitting starved a tail
+                          # record), so the OOM fix lives in chunked_sliced_ce's chunk size, not here.
   gradient_checkpointing: true
   max_grad_norm: 1.0
   seed: 0
