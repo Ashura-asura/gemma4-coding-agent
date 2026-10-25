@@ -192,6 +192,85 @@ def prepare_for_qlora(model: Any, torch: Any) -> Any:
     return model
 
 
+def offload_per_layer_embedding(model: Any, torch: Any, *, force: bool = False) -> int:
+    """Keep Gemma-4's per-layer embedding (PLE) table in host RAM, not on the GPU.
+
+    ``embed_tokens_per_layer`` is a frozen lookup table of
+    [262144, num_layers * 256] 16-bit values (~5.2 GiB for E4B), ~60% of the
+    8.79 GiB resident after load (kernel v16). bitsandbytes does not quantize
+    it and it never receives gradients, so it only ever answers
+    ``table[input_ids]``. That gather is done on the CPU and only the
+    [B, S, num_layers*256] result (tens of MB) crosses to the GPU.
+
+    The table is held by the forward closure as a plain tensor — NOT as a
+    Parameter/buffer — so a later ``model.to("cuda")`` (Trainer/accelerate)
+    cannot silently drag it back. The module keeps a zero-row placeholder
+    weight so dtype/shape reads still work. Returns bytes removed from the GPU.
+    """
+    import gc
+
+    emb = None
+    for name, mod in model.named_modules():
+        if name.rsplit(".", 1)[-1] == "embed_tokens_per_layer" and isinstance(mod, torch.nn.Embedding):
+            emb = mod
+            break
+    if emb is None:
+        print("[sft] PLE offload: no embed_tokens_per_layer in this checkpoint — skipped", flush=True)
+        return 0
+    weight = emb.weight
+    if weight.device.type != "cuda" and not force:
+        print(f"[sft] PLE offload: table already on {weight.device} — skipped", flush=True)
+        return 0
+
+    gpu = weight.device
+    dtype = weight.dtype
+    nbytes = weight.numel() * weight.element_size()
+    padding_idx = emb.padding_idx
+    scale = None
+    if getattr(emb, "embed_scale", None) is not None:
+        scale = emb.embed_scale.detach().to(device=gpu, dtype=dtype)  # same math as the stock forward
+
+    try:  # an accelerate dispatch hook would try to re-place the weight
+        from accelerate.hooks import remove_hook_from_module
+
+        remove_hook_from_module(emb, recurse=False)
+    except Exception:
+        pass
+
+    before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    table = weight.detach().to("cpu", copy=True)
+    table.requires_grad_(False)
+    emb.weight = torch.nn.Parameter(
+        torch.empty((0, table.shape[1]), dtype=dtype, device=gpu), requires_grad=False
+    )
+    del weight
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    def forward(input_ids: Any) -> Any:
+        out = torch.nn.functional.embedding(input_ids.to("cpu"), table, padding_idx)
+        out = out.to(gpu)
+        return out * scale if scale is not None else out
+
+    emb.forward = forward  # nn.Module.__call__ dispatches through self.forward
+
+    freed = (before - torch.cuda.memory_allocated()) if torch.cuda.is_available() else 0
+    print(
+        f"[sft] PLE offload: table {tuple(table.shape)} {dtype} = {nbytes / 2**30:.2f} GiB -> host RAM | "
+        f"GPU freed {freed / 2**30:.2f} GiB | alloc now "
+        f"{(torch.cuda.memory_allocated() / 2**30) if torch.cuda.is_available() else 0:.2f} GiB",
+        flush=True,
+    )
+    if torch.cuda.is_available() and freed < 0.8 * nbytes:
+        print(
+            "[sft] WARNING: PLE offload freed far less than the table size — something still "
+            "references the GPU tensor; the OOM headroom this relies on is NOT there.",
+            flush=True,
+        )
+    return nbytes
+
+
 def resolve_lora_targets(model: Any, leaves: Any, torch: Any) -> list[str]:
     """Exact module keys for LoRA injection over the policy language model.
 
@@ -411,6 +490,7 @@ def train(config_path: str, *, resume: str | None, base_override: str | None) ->
     from train.sft.data_collator import TrajectoryCollator
 
     model = prepare_for_qlora(model, torch)
+    offload_per_layer_embedding(model, torch)  # frees ~5 GiB of the 8.8 GiB resident (kernel v16 numbers)
     lora = config["lora"]
     targets = resolve_lora_targets(model, lora["target_modules"], torch)
     print(f"[sft] LoRA targets: {len(targets)} modules", flush=True)
