@@ -390,3 +390,45 @@ def test_recovery_example_masks_the_bad_call_and_keeps_the_good_one():
     good_edits = [m for m in msgs if m["role"] == "assistant" and m.get("train") is None
                   and m["tool_calls"][0]["function"]["name"] == "edit_file"]
     assert len(good_edits) == 1
+
+
+# --------------------------------------------------------------- venv bootstrap
+def test_create_venv_falls_back_to_without_pip(tmp_path: Path, monkeypatch) -> None:
+    """Kaggle's ensurepip is broken: plain venv fails, --without-pip must win."""
+    calls: list[list[str]] = []
+    codes = iter([1, 1, 0])
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, next(codes), b"", b"ensurepip exploded")
+
+    monkeypatch.setattr(common, "_run", fake_run)
+    monkeypatch.setattr(common, "base_python", lambda: "python")
+    common._create_venv(tmp_path / "venv")
+
+    assert [c[1:3] for c in calls] == [
+        ["-m", "venv"], ["-m", "venv"], ["-m", "venv"],
+    ]
+    assert calls[0][3:4] == [str(tmp_path / "venv")]
+    assert calls[2][3:4] == ["--without-pip"]
+
+
+def test_pip_install_bootstraps_with_system_pip(tmp_path: Path, monkeypatch) -> None:
+    """A --without-pip venv installs through the host pip --python <venv>."""
+    py = tmp_path / "bin" / "python"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        if cmd[1:3] == ["-m", "pip"] and cmd[3:4] == ["--version"]:
+            return subprocess.CompletedProcess(cmd, 1, b"", b"No module named pip")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(common, "_run", fake_run)
+    monkeypatch.setattr(common, "base_python", lambda: "system-python")
+    common._pip_install(py, ["pytest"], "slug")
+
+    install = calls[-1]
+    assert install[0] == "system-python"
+    assert install[3:5] == ["--python", str(py)]
+    assert "pytest" in install and "wrapt" in install

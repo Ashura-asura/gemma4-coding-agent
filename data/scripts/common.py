@@ -420,6 +420,57 @@ def _write_shims(slug: str, setup: dict[str, Any]) -> None:
     os.replace(tmp, site / "sitecustomize.py")
 
 
+def _venv_env() -> dict[str, str]:
+    """Env for venv creation/pip. Kaggle exports PYTHONPATH=kagglegym libs that
+    leak into the fresh venv and break its pip bootstrap (probe-verified)."""
+    env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME"}}
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
+def _create_venv(path: Path) -> None:
+    """Create a venv, tolerating hosts whose ensurepip is broken.
+
+    Kaggle's image Python 3.13 fails ``venv`` at the ensurepip step (exit 1
+    under the image sitecustomize); ``--without-pip`` succeeds and pip can be
+    driven through the *system* pip with ``--python`` (pip >= 23.2). Probe
+    ``gemma-4-eval-env-probe`` verified: plain -> rc 1, --system-site-packages
+    -> rc 1, --without-pip -> rc 0, system ``pip --python`` -> rc 0.
+    """
+    VENV_DIR.mkdir(parents=True, exist_ok=True)
+    last = None
+    for extra in (
+        ["-m", "venv"],
+        ["-m", "venv", "--system-site-packages"],
+        ["-m", "venv", "--without-pip"],
+    ):
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        last = _run([base_python(), *extra, str(path)], timeout=600, env=_venv_env())
+        if last.returncode == 0:
+            return
+    stderr = last.stderr.decode(errors="replace")[:400] if last is not None else ""
+    raise RuntimeError(f"venv creation failed for {path.name}: {stderr}")
+
+
+def _pip_install(py: Path, deps: list[str], label: str) -> None:
+    """Install into the venv; bootstrap via system pip when it has none."""
+    env = _venv_env()
+    has_pip = _run([str(py), "-m", "pip", "--version"], timeout=120, env=env).returncode == 0
+    if has_pip:
+        cmd = [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *deps]
+    else:
+        # the image sitecustomize imports wrapt; without it every venv
+        # interpreter startup prints a traceback to stderr during tests
+        cmd = [
+            base_python(), "-m", "pip", "--python", str(py),
+            "install", "-q", "--disable-pip-version-check", *deps, "wrapt",
+        ]
+    result = _run(cmd, timeout=1800, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"pip install failed for {label}: {result.stderr.decode(errors='replace')[-600:]}")
+
+
 def ensure_venv(repo: str, *, tier: str | None = None) -> Path:
     """Create (once) and populate the venv for ``repo``. Returns its python.
 
@@ -437,17 +488,11 @@ def ensure_venv(repo: str, *, tier: str | None = None) -> Path:
     slug = slugify(repo) + suffix
     py = venv_python(slug)
     if not py.exists():
-        VENV_DIR.mkdir(parents=True, exist_ok=True)
-        result = _run([base_python(), "-m", "venv", str(VENV_DIR / slug)], timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"venv creation failed for {repo}: {result.stderr.decode(errors='replace')[:400]}")
+        _create_venv(VENV_DIR / slug)
     marker = VENV_DIR / f"{slug}.deps.ok"
     if not marker.exists():
         # tzdata: Windows has no system IANA zone database for zoneinfo
-        deps = ["pytest", "setuptools", "wheel", "tzdata", *deps]
-        result = _run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *deps], timeout=1800)
-        if result.returncode != 0:
-            raise RuntimeError(f"pip install failed for {repo}: {result.stderr.decode(errors='replace')[-600:]}")
+        _pip_install(py, ["pytest", "setuptools", "wheel", "tzdata", *deps], repo)
         marker.write_text("ok", encoding="utf-8")
     _write_shims(slug, {**setup, "shims": shims})
     return py
@@ -489,18 +534,10 @@ def ensure_venv_by_slug(slug: str) -> Path:
                 return ensure_venv(repo, tier=tier)
     py = venv_python(slug)
     if not py.exists():
-        VENV_DIR.mkdir(parents=True, exist_ok=True)
-        result = _run([base_python(), "-m", "venv", str(VENV_DIR / slug)], timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"venv creation failed for {slug}: {result.stderr.decode(errors='replace')[:400]}")
+        _create_venv(VENV_DIR / slug)
     marker = VENV_DIR / f"{slug}.deps.ok"
     if not marker.exists():
-        result = _run(
-            [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", "pytest", "setuptools", "wheel"],
-            timeout=1800,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"pip install failed for {slug}: {result.stderr.decode(errors='replace')[-600:]}")
+        _pip_install(py, ["pytest", "setuptools", "wheel"], slug)
         marker.write_text("ok", encoding="utf-8")
     return py
 
