@@ -463,6 +463,12 @@ def main(argv: list[str] | None = None) -> int:
         rewards = [r for g in groups for r in g["rewards"]]
         mean_reward = sum(rewards) / len(rewards) if rewards else 0.0
         best = max(rewards) if rewards else 0.0
+        if stats["sequences"] == 0:
+            # a zero-sequence update trains nothing: keep the first error visible
+            # instead of silently burning the whole budget on vacuous steps
+            errors = [r.get("error") for g in groups for r in g["rollouts"] if r.get("error")]
+            if errors:
+                print(f"[grpo] WARNING: update {update} did no training; first rollout error: {errors[0]}", flush=True)
         print(
             f"[grpo] update {update}: loss={stats['loss']:.4f} pg={stats['pg']:.4f} "
             f"kl={stats['kl']:.4f} mean_reward={mean_reward:.3f} "

@@ -237,3 +237,30 @@ def test_categorize_test_environment_issue() -> None:
         "test_status": "timeout",
     }
     assert categorize(record) == "test_environment_issue"
+
+
+def test_main_dump_trajectories_survives_early_exit_records(tmp_path, monkeypatch) -> None:
+    """Env/checkout early exits have no 'trajectory' key — the run must not crash
+    (kernel eval v2 died with KeyError on the first Kaggle task)."""
+    import eval.run_eval as run_eval
+
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text(json.dumps({"task_id": "t1", "repo": "r1", "issue": "x"}) + "\n")
+    out = tmp_path / "out.jsonl"
+    traj = tmp_path / "traj.jsonl"
+
+    def fake_evaluate(task, factory, **kwargs):
+        return {
+            "task_id": task["task_id"], "repo": "r1", "status": "error", "steps": 0,
+            "resolved": False, "patch_valid": False, "test_status": "error",
+            "reason": "environment setup failed",
+        }
+
+    monkeypatch.setattr(run_eval, "evaluate_task", fake_evaluate)
+    code = run_eval.main([
+        "--policy", "null", "--tasks", str(tasks), "--out", str(out),
+        "--dump-trajectories", str(traj),
+    ])
+    assert code == 0
+    assert json.loads(traj.read_text(encoding="utf-8").splitlines()[0]) is None
+    assert json.loads(out.read_text(encoding="utf-8").splitlines()[0])["task_id"] == "t1"

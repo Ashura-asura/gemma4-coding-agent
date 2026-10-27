@@ -703,7 +703,11 @@ def main(argv: list[str] | None = None) -> int:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fh.flush()
                 if trajectory_fh:
-                    trajectory_fh.write(json.dumps(record.pop("trajectory"), ensure_ascii=False) + "\n")
+                    # early-exit records (env/checkout failure) never ran an
+                    # episode, so they carry no "trajectory" key — write a null
+                    # placeholder rather than crashing the whole eval run
+                    trajectory = record.pop("trajectory", None)
+                    trajectory_fh.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
                     trajectory_fh.flush()
                 mark = "resolved" if record["resolved"] else record["status"]
                 print(f"[{index}/{len(tasks)}] {task['task_id']}: {mark}", flush=True)
