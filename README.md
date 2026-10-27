@@ -19,20 +19,21 @@ being built.
 |---|---|
 | 1. Sandbox + tool interface | **done** — adversarial suite green on win32 + Linux (WSL); 5 tools + loop wired; eval harness runs end-to-end with a null policy |
 | 2. Data pipeline | **done** — 9 repos end-to-end; runnable pool 1786; holdout frozen at 291; RL pool 291; SFT build finished: **870 test-verified trajectories** (§8.2 gate 500–1000 ✓), mirrored to the `gemma4-coding-agent-repo` Kaggle dataset |
-| 3. SFT (QLoRA) | **code ready** — `train/sft/trainer.py` + completion-only collator, `configs/sft_config.yaml`, `kaggle/sft.ipynb` (T4/P100, resumable `--resume auto`); runs once the SFT build finishes |
-| 4. RL (GRPO) | **code ready** — `train/rl/` reward + rollout worker + GRPO trainer (group-normalized PG, k3-KL to the frozen SFT baseline, shared-policy rollouts, resumable every-25-update checkpoints), `configs/rl_config.yaml`, `scripts/run_rl.sh`; runs on the Kaggle GPU after SFT |
-| 5. Eval + ablations | not started |
+| 3. SFT (QLoRA) | **done** — Kaggle kernel v22 on E4B: 33/33 steps, 515 trajectories, loss 0.648→0.301→0.264 (no collapse), grad_norm 0.41→0.19, adapter `ashuraasura/sft-adapter`. OOM fixed by per-layer-embedding offload (~5.25 GiB to host RAM) + CE chunk 128. |
+| 4. RL (GRPO) | **validated on Kaggle (dry-run + probe)** — `train/rl/` reward + rollout worker + GRPO trainer (group-normalized PG, k3-KL to the frozen SFT baseline, shared-policy rollouts, resumable every-25-update checkpoints), `configs/rl_config.yaml`, `scripts/run_rl.sh`; smoke run in flight post-SFT |
+| 5. Eval + ablations | **in progress** — `kaggle/eval.ipynb` scores SFT adapter vs zero-shot base on the frozen 291-task holdout (smoke `EVAL_LIMIT=10`, full `EVAL_LIMIT=0`) |
 | 6. Write-up | not started |
 
-Rung 0 (`ARCHITECTURE.md` §8.1) still needs the base/instruct model on the
-Kaggle GPU host — nothing is trusted as a reward signal until the sandbox
-suite and a baseline eval have been run there, not just on this Windows box.
+Rung 0 (`ARCHITECTURE.md` §8.1) is being measured by the eval kernel on the
+Kaggle GPU host (base/instruct zero-shot vs SFT adapter, same holdout slice).
+Sandbox isolation on Kaggle is `best_effort` (unshare is seccomp-blocked) and
+is disclosed with every number.
 
 Kaggle notebooks (private kernels, `kaggle/` is the source of truth):
 SFT → <https://www.kaggle.com/code/ashuraasura/gemma-4-qlora-sft-architecture-2-4>,
-GRPO → <https://www.kaggle.com/code/ashuraasura/gemma-4-grpo-rl>.
-Both need the `GH_TOKEN` secret; the GRPO kernel additionally needs the
-SFT adapter uploaded as a Dataset input.
+GRPO → <https://www.kaggle.com/code/ashuraasura/gemma-4-grpo-rl>,
+Eval → <https://www.kaggle.com/code/ashuraasura/gemma-4-eval-holdout-architecture-2-6>.
+The GRPO and eval kernels mount the SFT adapter (`ashuraasura/sft-adapter`).
 
 ## Layout
 
