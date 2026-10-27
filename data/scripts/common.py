@@ -453,20 +453,24 @@ def _create_venv(path: Path) -> None:
     raise RuntimeError(f"venv creation failed for {path.name}: {stderr}")
 
 
+def _pip_command(py: Path) -> tuple[list[str], bool]:
+    """Command prefix that installs into ``py``; second item = venv has pip."""
+    env = _venv_env()
+    if _run([str(py), "-m", "pip", "--version"], timeout=120, env=env).returncode == 0:
+        return [str(py), "-m", "pip"], True
+    # --without-pip venv: the host pip targets it explicitly (pip >= 23.2)
+    return [base_python(), "-m", "pip", "--python", str(py)], False
+
+
 def _pip_install(py: Path, deps: list[str], label: str) -> None:
     """Install into the venv; bootstrap via system pip when it has none."""
-    env = _venv_env()
-    has_pip = _run([str(py), "-m", "pip", "--version"], timeout=120, env=env).returncode == 0
-    if has_pip:
-        cmd = [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *deps]
-    else:
+    prefix, has_pip = _pip_command(py)
+    cmd = [*prefix, "install", "-q", "--disable-pip-version-check", *deps]
+    if not has_pip:
         # the image sitecustomize imports wrapt; without it every venv
         # interpreter startup prints a traceback to stderr during tests
-        cmd = [
-            base_python(), "-m", "pip", "--python", str(py),
-            "install", "-q", "--disable-pip-version-check", *deps, "wrapt",
-        ]
-    result = _run(cmd, timeout=1800, env=env)
+        cmd.append("wrapt")
+    result = _run(cmd, timeout=1800, env=_venv_env())
     if result.returncode != 0:
         raise RuntimeError(f"pip install failed for {label}: {result.stderr.decode(errors='replace')[-600:]}")
 
@@ -552,8 +556,9 @@ def prepare_checkout(repo: str, directory: str | Path) -> None:
     build_env = dict(os.environ)
     build_env.setdefault("SETUPTOOLS_SCM_PRETEND_VERSION", "6.0.0")
     build_env.setdefault("VCS_VERSIONING_PRETEND_VERSION", "6.0.0")
+    prefix, _ = _pip_command(py)
     result = _run(
-        [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check",
+        [*prefix, "install", "-q", "--disable-pip-version-check",
          "--no-deps", "--no-build-isolation", "--no-index", "-e", str(directory)],
         timeout=600,
         env=build_env,
