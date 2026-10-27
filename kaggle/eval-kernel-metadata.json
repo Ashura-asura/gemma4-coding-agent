@@ -1,0 +1,22 @@
+{
+  "id": "ashuraasura/gemma-4-eval-holdout-architecture-2-6",
+  "id_no": 141224851,
+  "title": "Gemma-4 Eval Holdout (ARCHITECTURE 2.6)",
+  "code_file": "notebook.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [],
+  "dataset_sources": [
+    "ashuraasura/gemma4-coding-agent-repo",
+    "ashuraasura/sft-adapter"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [
+    "google/gemma-4/Transformers/gemma-4-e4b-it/1"
+  ]
+}
