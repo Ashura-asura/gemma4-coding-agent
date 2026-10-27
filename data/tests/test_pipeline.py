@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -425,10 +426,29 @@ def test_pip_install_bootstraps_with_system_pip(tmp_path: Path, monkeypatch) -> 
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
     monkeypatch.setattr(common, "_run", fake_run)
-    monkeypatch.setattr(common, "base_python", lambda: "system-python")
+    monkeypatch.setattr(common, "_pip_host", lambda: "system-python")
     common._pip_install(py, ["pytest"], "slug")
 
     install = calls[-1]
     assert install[0] == "system-python"
     assert install[3:5] == ["--python", str(py)]
     assert "pytest" in install and "wrapt" in install
+
+
+def test_pip_host_skips_interpreter_without_pip(monkeypatch) -> None:
+    """Kaggle's preferred python3.10 has no pip; the host pip must come from
+    an interpreter that actually has one (RL v8 failed with 'No module named
+    pip')."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0 if cmd[0] == "good-python" else 1, b"", b"")
+
+    monkeypatch.setattr(common, "_run", fake_run)
+    monkeypatch.setattr(common, "sys", types.SimpleNamespace(executable="bad-python"))
+    monkeypatch.setattr(common, "base_python", lambda: "good-python")
+    monkeypatch.setattr(common.shutil, "which", lambda name: name)
+
+    assert common._pip_host() == "good-python"
+    assert [c[0] for c in calls] == ["bad-python", "good-python"]

@@ -453,13 +453,34 @@ def _create_venv(path: Path) -> None:
     raise RuntimeError(f"venv creation failed for {path.name}: {stderr}")
 
 
+def _pip_host() -> str:
+    """Interpreter whose ``-m pip`` works.
+
+    The preferred base python is not guaranteed to ship pip: the RL kernel's
+    image has ``/usr/bin/python3.10`` (chosen for old SWE-bench code) with no
+    pip, while the notebook's interpreter does. A pip-less venv must be
+    bootstrapped by a pip that can target it via ``--python``.
+    """
+    candidates = [sys.executable, base_python(), "python3", "python3.13", "python3.12", "python3.11"]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if not Path(candidate).exists() and shutil.which(candidate) is None:
+            continue
+        if _run([candidate, "-m", "pip", "--version"], timeout=120, env=_venv_env()).returncode == 0:
+            return candidate
+    raise RuntimeError("no host interpreter with pip; cannot bootstrap task venvs")
+
+
 def _pip_command(py: Path) -> tuple[list[str], bool]:
     """Command prefix that installs into ``py``; second item = venv has pip."""
     env = _venv_env()
     if _run([str(py), "-m", "pip", "--version"], timeout=120, env=env).returncode == 0:
         return [str(py), "-m", "pip"], True
-    # --without-pip venv: the host pip targets it explicitly (pip >= 23.2)
-    return [base_python(), "-m", "pip", "--python", str(py)], False
+    # --without-pip venv: a host pip targets it explicitly (pip >= 23.2)
+    return [_pip_host(), "-m", "pip", "--python", str(py)], False
 
 
 def _pip_install(py: Path, deps: list[str], label: str) -> None:
