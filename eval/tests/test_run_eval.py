@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent.loop import ScriptedPolicy
 from agent.context import ToolCall
-from eval.report import categorize, format_report, summarize
+from eval.report import (
+    categorize,
+    format_report,
+    paired_comparison,
+    summarize,
+    wilson_interval,
+)
 from eval.run_eval import (
     PatchError,
     apply_patch_to_tree,
@@ -16,6 +23,7 @@ from eval.run_eval import (
     evaluate_task,
     load_tasks,
     parse_tool_call,
+    policy_dtype,
     score_submission,
     split_multifile_patch,
 )
@@ -228,6 +236,49 @@ def test_summarize_and_format() -> None:
     assert "resolved-rate" in text
     assert "per repo:" in text
     assert "r2" in text
+    assert summary["resolved_rate_ci95"][0] < summary["resolved_rate"] < summary["resolved_rate_ci95"][1]
+
+
+def test_wilson_interval_is_wide_at_24_tasks() -> None:
+    """3/24 resolved is ~12.5% with a 95% interval spanning roughly 4-31%."""
+    low, high = wilson_interval(3, 24)
+    assert 0.03 < low < 0.06
+    assert 0.28 < high < 0.34
+
+
+def test_paired_comparison_counts_discordant_tasks() -> None:
+    treatment = [
+        {"task_id": "a", "resolved": True},
+        {"task_id": "b", "resolved": False},
+        {"task_id": "c", "resolved": True},
+    ]
+    baseline = [
+        {"task_id": "a", "resolved": False},
+        {"task_id": "b", "resolved": True},
+        {"task_id": "c", "resolved": True},
+    ]
+    paired = paired_comparison(treatment, baseline)
+    assert paired["n_paired"] == 3
+    assert paired["treatment_only"] == 1
+    assert paired["baseline_only"] == 1
+    assert paired["both"] == 1
+    assert paired["neither"] == 0
+    assert paired["mcnemar_exact_p"] == 1.0
+
+
+def test_policy_dtype_matches_trainer_on_t4() -> None:
+    """T4 is not bf16-capable; eval must use fp16 like SFT, not bf16."""
+    fake = SimpleNamespace(
+        float32="fp32",
+        float16="fp16",
+        bfloat16="bf16",
+        cuda=SimpleNamespace(is_available=lambda: True, is_bf16_supported=lambda: False),
+    )
+    assert policy_dtype(fake) == "fp16"
+    fake.cuda.is_bf16_supported = lambda: True
+    assert policy_dtype(fake) == "bf16"
+    fake.cuda.is_available = lambda: False
+    assert policy_dtype(fake) == "fp32"
 
 
 def test_categorize_test_environment_issue() -> None:

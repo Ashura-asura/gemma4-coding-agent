@@ -407,6 +407,21 @@ def _parse_json_tool_call(text: str) -> ToolCall:
     raise MalformedCall(f"no tool call found in model output: {text[:200]!r}")
 
 
+def policy_dtype(torch: Any) -> Any:
+    """Match the trainer: fp16 on T4/P100, bf16 only where the GPU supports it.
+
+    ``torch.cuda.is_available()`` alone selected bf16 on a T4, where the
+    trainer had correctly fallen back to fp16. The mismatch made eval slower
+    and different from the dtype the adapter was trained under.
+    """
+    if not torch.cuda.is_available():
+        return torch.float32
+    supported = getattr(torch.cuda, "is_bf16_supported", None)
+    if supported is not None and supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 class HFPolicy:
     """Zero-shot (Rung 0) or adapter-loaded (Rungs 1-3) transformers policy."""
 
@@ -444,7 +459,7 @@ class HFPolicy:
 
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        dtype = policy_dtype(torch)
         kwargs: dict[str, Any] = {"torch_dtype": dtype}
         self._quantized = bool(quantize and torch.cuda.is_available())
         if self._quantized:

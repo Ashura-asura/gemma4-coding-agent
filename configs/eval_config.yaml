@@ -7,7 +7,7 @@ model_checkpoint: null                   # rung being scored: base, checkpoints/
 rollout:
   max_steps: 30
   max_tokens_per_step: 2048
-  temperature: 0.2
+  temperature: 0.0        # greedy: paired comparison needs one fixed outcome per task
   n_trials: 1              # raise only for sampling-strategy ablation (§8.1 Rung 4)
 
 report:

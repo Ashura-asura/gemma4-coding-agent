@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from math import comb, sqrt
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -45,6 +46,48 @@ def categorize(record: dict[str, Any]) -> str:
     return "wrong_file"
 
 
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval — honest error bars for a 24-task subset."""
+    if n <= 0:
+        return (0.0, 1.0)
+    p = successes / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2.0 * n)) / denom
+    margin = z * sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denom
+    return (max(0.0, centre - margin), min(1.0, centre + margin))
+
+
+def paired_comparison(
+    treatment: Iterable[dict[str, Any]], baseline: Iterable[dict[str, Any]]
+) -> dict[str, Any]:
+    """Per-task paired comparison of two policies on the same task set.
+
+    At n=24 a difference in resolved-rate alone is too noisy; report the
+    discordant tasks and an exact McNemar test instead of just two rates.
+    """
+    treated = {str(r.get("task_id")): bool(r.get("resolved")) for r in treatment}
+    control = {str(r.get("task_id")): bool(r.get("resolved")) for r in baseline}
+    ids = sorted(set(treated) & set(control))
+    treatment_only = sum(1 for i in ids if treated[i] and not control[i])
+    baseline_only = sum(1 for i in ids if control[i] and not treated[i])
+    both = sum(1 for i in ids if treated[i] and control[i])
+    neither = len(ids) - treatment_only - baseline_only - both
+    discordant = treatment_only + baseline_only
+    if discordant == 0:
+        p_value = 1.0
+    else:
+        tail = sum(comb(discordant, i) for i in range(min(treatment_only, baseline_only) + 1))
+        p_value = min(1.0, 2.0 * tail / (2**discordant))
+    return {
+        "n_paired": len(ids),
+        "treatment_only": treatment_only,
+        "baseline_only": baseline_only,
+        "both": both,
+        "neither": neither,
+        "mcnemar_exact_p": p_value,
+    }
+
+
 def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
     records = list(records)
     total = len(records)
@@ -61,10 +104,13 @@ def summarize(records: Iterable[dict[str, Any]]) -> dict[str, Any]:
         bucket["n"] += 1
         bucket["resolved"] += int(bool(record.get("resolved")))
 
+    ci_low, ci_high = wilson_interval(len(resolved), total)
+
     return {
         "n_tasks": total,
         "n_resolved": len(resolved),
         "resolved_rate": (len(resolved) / total) if total else 0.0,
+        "resolved_rate_ci95": [ci_low, ci_high],
         "n_submitted": len(submitted),
         "patch_validity_rate": (len(valid) / total) if total else 0.0,
         "avg_steps_to_submit": (sum(steps) / len(steps)) if steps else None,
@@ -86,6 +132,8 @@ def format_report(summary: dict[str, Any]) -> str:
         f"tasks            : {summary['n_tasks']}",
         f"resolved         : {summary['n_resolved']}",
         f"resolved-rate    : {summary['resolved_rate']:.1%}",
+        "  95% Wilson CI  : "
+        f"{summary['resolved_rate_ci95'][0]:.1%} – {summary['resolved_rate_ci95'][1]:.1%}",
         f"patch validity   : {summary['patch_validity_rate']:.1%}",
         "avg steps        : "
         + (f"{summary['avg_steps_to_submit']:.1f}" if summary["avg_steps_to_submit"] is not None else "n/a"),
@@ -112,10 +160,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Summarise an eval run")
     parser.add_argument("records", help="JSONL produced by eval/run_eval.py")
     parser.add_argument("--out", help="Optional path for the summary JSON")
+    parser.add_argument(
+        "--baseline",
+        help="Optional second JSONL: paired per-task comparison (e.g. base vs SFT)",
+    )
     args = parser.parse_args(argv)
 
-    summary = summarize(load_records(args.records))
+    records = load_records(args.records)
+    summary = summarize(records)
     print(format_report(summary))
+    if args.baseline:
+        paired = paired_comparison(records, load_records(args.baseline))
+        print("\npaired comparison (this run vs baseline):")
+        print(
+            f"  n={paired['n_paired']} | treatment-only={paired['treatment_only']} | "
+            f"baseline-only={paired['baseline_only']} | both={paired['both']} | "
+            f"neither={paired['neither']} | McNemar exact p={paired['mcnemar_exact_p']:.3f}"
+        )
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return 0
