@@ -237,7 +237,14 @@ def offload_per_layer_embedding(model: Any, torch: Any, *, force: bool = False) 
     except Exception:
         pass
 
-    before = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    # account on the table's own device: device_map="auto" may put it on
+    # cuda:1 while the process default is cuda:0 (RL v10 printed a bogus
+    # "freed 0.00 GiB" warning for a 5.25 GiB offload)
+    device_index = gpu.index if gpu.type == "cuda" else None
+    def _allocated() -> int:
+        return torch.cuda.memory_allocated(device_index) if torch.cuda.is_available() else 0
+
+    before = _allocated()
     table = weight.detach().to("cpu", copy=True)
     table.requires_grad_(False)
     emb.weight = torch.nn.Parameter(
@@ -255,7 +262,7 @@ def offload_per_layer_embedding(model: Any, torch: Any, *, force: bool = False) 
 
     emb.forward = forward  # nn.Module.__call__ dispatches through self.forward
 
-    freed = (before - torch.cuda.memory_allocated()) if torch.cuda.is_available() else 0
+    freed = before - _allocated()
     print(
         f"[sft] PLE offload: table {tuple(table.shape)} {dtype} = {nbytes / 2**30:.2f} GiB -> host RAM | "
         f"GPU freed {freed / 2**30:.2f} GiB | alloc now "
