@@ -111,6 +111,11 @@ def load_policy(config: dict[str, Any], *, quantize: bool = True) -> tuple[Any, 
     for name, parameter in policy.named_parameters():
         if ".ref." in name or "reference" in name:
             parameter.requires_grad = False
+    # training keeps the frozen 5.2 GiB PLE table in host RAM (SFT v22 fix);
+    # rollouts share this model, so the same headroom applies to generation
+    from train.sft.trainer import offload_per_layer_embedding
+
+    offload_per_layer_embedding(policy, torch)
 
     tokenizer = AutoTokenizer.from_pretrained(base_id)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:

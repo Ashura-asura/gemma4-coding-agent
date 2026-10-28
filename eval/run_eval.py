@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -54,6 +55,25 @@ __all__ = [
 ]
 
 DEFAULT_MAX_STEPS = 30
+#: Generation prompt budget. Each episode appends a tool result per step, so
+#: an uncapped 30-step context eventually OOMs a 16 GiB T4 even in 4-bit
+#: (eval v4: 14-21 steps -> CUDA OOM). Keep the system prompt / issue head
+#: and the most recent turns; older observations are safe to drop.
+MAX_PROMPT_TOKENS = int(os.environ.get("EVAL_MAX_PROMPT_TOKENS", "12288"))
+
+
+def cap_prompt_tokens(inputs: dict[str, Any], limit: int, torch: Any) -> dict[str, Any]:
+    """Left-truncate a tokenized prompt to ``limit`` ids, keeping head + tail."""
+    ids = inputs.get("input_ids")
+    if limit <= 0 or ids is None or ids.shape[1] <= limit:
+        return inputs
+    head = min(2048, limit // 4)
+    tail = limit - head
+    for key in ("input_ids", "attention_mask"):
+        value = inputs.get(key)
+        if value is not None:
+            inputs[key] = torch.cat([value[:, :head], value[:, -tail:]], dim=1)
+    return inputs
 DEFAULT_TEMPERATURE = 0.2
 
 
@@ -398,6 +418,7 @@ class HFPolicy:
         temperature: float = 0.2,
         quantize: bool = False,
         preloaded: tuple[Any, Any] | None = None,
+        max_prompt_tokens: int = MAX_PROMPT_TOKENS,
     ) -> None:
         if preloaded is not None:
             # GRPO shares its trainable model with rollouts instead of
@@ -408,6 +429,7 @@ class HFPolicy:
             self.model, self.tokenizer = preloaded
             self.max_new_tokens = max_new_tokens
             self.temperature = temperature
+            self.max_prompt_tokens = max_prompt_tokens
             self._quantized = False
             return
         if model_path is None:
@@ -449,9 +471,19 @@ class HFPolicy:
             self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
         if torch.cuda.is_available() and not self._quantized:
             self.model = self.model.cuda()
+        # E4B's per-layer embedding table is ~5.2 GiB and bitsandbytes keeps
+        # it in fp16: the same host-RAM offload SFT uses is what gives eval
+        # enough KV-cache headroom on a 16 GiB T4 (eval v4 OOMed at 14 steps).
+        try:
+            from train.sft.trainer import offload_per_layer_embedding
+
+            offload_per_layer_embedding(self.model, torch)
+        except Exception as exc:  # noqa: BLE001 - optimization, not correctness
+            print(f"[eval] PLE offload skipped: {type(exc).__name__}: {exc}", flush=True)
         self.model.eval()
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
+        self.max_prompt_tokens = max_prompt_tokens
 
     def _stop_ids(self) -> set[int]:
         ids: set[int] = set()
@@ -490,6 +522,7 @@ class HFPolicy:
         prompt = self.build_prompt(context)
         # the template already contains <bos>; adding it again degrades output
         inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        inputs = cap_prompt_tokens(inputs, self.max_prompt_tokens, self._torch)
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
         with self._torch.no_grad():
             output = self.model.generate(
@@ -501,6 +534,9 @@ class HFPolicy:
                 eos_token_id=sorted(self._stop_ids()) or None,
             )
         generated = output[0][inputs["input_ids"].shape[1]:].tolist()
+        del output
+        if self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()  # release the KV cache before parsing
         stops = self._stop_ids()
         for index, token_id in enumerate(generated):
             if token_id in stops:

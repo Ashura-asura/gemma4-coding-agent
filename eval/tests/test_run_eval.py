@@ -12,6 +12,7 @@ from eval.report import categorize, format_report, summarize
 from eval.run_eval import (
     PatchError,
     apply_patch_to_tree,
+    cap_prompt_tokens,
     evaluate_task,
     load_tasks,
     parse_tool_call,
@@ -264,3 +265,23 @@ def test_main_dump_trajectories_survives_early_exit_records(tmp_path, monkeypatc
     assert code == 0
     assert json.loads(traj.read_text(encoding="utf-8").splitlines()[0]) is None
     assert json.loads(out.read_text(encoding="utf-8").splitlines()[0])["task_id"] == "t1"
+
+
+def test_cap_prompt_tokens_keeps_head_and_tail() -> None:
+    """Eval v4 OOMed once contexts grew past ~10k tokens; the cap must keep
+    the issue/system head and the newest turns, and stay within the budget."""
+    torch = pytest.importorskip("torch")
+    ids = torch.arange(20).reshape(1, 20)
+    mask = torch.ones_like(ids)
+    out = cap_prompt_tokens({"input_ids": ids, "attention_mask": mask}, 10, torch)
+    assert out["input_ids"].shape == (1, 10)
+    assert out["input_ids"][0, 0].item() == 0
+    assert out["input_ids"][0, -1].item() == 19
+    assert out["attention_mask"].shape == (1, 10)
+
+
+def test_cap_prompt_tokens_is_noop_under_limit() -> None:
+    torch = pytest.importorskip("torch")
+    ids = torch.arange(4).reshape(1, 4)
+    out = cap_prompt_tokens({"input_ids": ids}, 10, torch)
+    assert out["input_ids"] is ids
