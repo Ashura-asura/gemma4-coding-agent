@@ -21,7 +21,7 @@ passes (run `python -m pytest -q`, see *How to verify*).
 | M2 | Medium | Regression (pass-to-pass) tests missing for Django/sympy (77 % of holdout). | Scorer accepts `p2p_targets`; **data must be rebuilt** to populate it. | code path only |
 | M3 | Medium | PEFT nested adapter layout → silent no-resume / unloadable final adapter. | `train/rl/checkpoints.py` flattens; resume refuses to start from scratch silently. | `test_audit_fixes.py` (fake PEFT; verify once with real PEFT) |
 | M4 | Medium | Dev gate never ran (`dev_slice: null`), 4 tasks from the training pool. | `dev_slice: auto` carves 24 held-out tasks, 12 per eval, patience-based stop, `best` adapter. | `test_audit_fixes.py` |
-| M5 | Medium | Holdout validity: SWE-bench is public; instance-level split (17 holdout tasks share a base commit with SFT, 2 share issue text). | **Not changed** — report a repo-disjoint / post-cutoff slice and disclose possible pre-training contamination. | — |
+| M5 | Medium | Holdout validity: SWE-bench is public; instance-level split (17 holdout tasks share a base commit with SFT, 2 share issue text). | **Partially mitigated** — the 23 holdout tasks sharing a base commit or issue text with either the SFT or RL pool are excluded from the 24-task headline subset; the full 291-task holdout is unchanged and still overlaps. Public SWE-bench pre-training exposure remains. | `data/holdout_eval_subset.jsonl` rebuilt from 268 clean holdout tasks |
 | M6 | Medium | No seeding of torch. | `torch.manual_seed`. | — |
 | M7 | Medium | Notebook put `GH_TOKEN` in the clone URL (persisted in `.git/config`, visible to payloads). | Transient auth header, token removed from env; no LICENSE → added placeholder; see `DATA_LICENSES.md`. | — |
 
