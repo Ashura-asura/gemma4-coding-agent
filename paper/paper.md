@@ -9,9 +9,8 @@ method, compute accounting and failure analysis are final unless noted.
 We post-train Gemma 4 E4B into a repository-editing agent that runs entirely
 offline inside a CPU-sandboxed tool loop. The pipeline is QLoRA supervised
 fine-tuning (SFT) on 515 compacted, test-verified tool-use trajectories
-(from 870 built), followed by
-group-relative policy optimization (GRPO) on a disjoint 267-task pool with a
-test-execution reward. All training and evaluation run on a single free-tier
+(from 870 built), followed by a GRPO attempt on a disjoint 267-task pool with
+a test-execution reward. All training and evaluation run on a single free-tier
 Kaggle T4 (16 GiB). We report resolved rate, patch validity and failure modes
 on a frozen, repo-stratified 24-task subset of a 291-task held-out split, and
 we state the compute-driven reductions explicitly. `TBD: one-sentence result.`
@@ -147,7 +146,8 @@ the frozen SFT adapter. Budget after measurement on the T4:
 | Metrics | resolved rate, patch validity, steps-to-submit, failure category |
 | Sandbox | `best_effort` isolation on Kaggle (seccomp blocks `unshare`) |
 
-Decoding for evaluation is temperature 0.2. A task counts as resolved only
+Decoding for evaluation is greedy (temperature 0) so each task has one fixed
+outcome for the paired McNemar test. A task counts as resolved only
 if the submitted patch applies to a fresh checkout, touches no test/harness
 file, and makes the task's tests pass with at least one test executed and
 none skipped. This blocks the obvious reward hack of editing the tests.
@@ -162,7 +162,7 @@ Table 1. Held-out results (24 tasks; 12 steps; 512 new tokens).
 |---|---|---|---|---|
 | Base Gemma 4 E4B (zero-shot) | TBD | TBD | TBD | TBD |
 | + QLoRA SFT | TBD | TBD | TBD | TBD |
-| + GRPO (if gate passes) | TBD | TBD | TBD | TBD |
+| + GRPO | not evaluated — no learning signal, no checkpoint | — | — | — |
 
 At 24 tasks the confidence intervals are wide by construction: **3/24
 resolved is 12.5% with a 95% Wilson interval of roughly 4–31%**. We therefore
@@ -171,8 +171,19 @@ comparison (treatment-only vs baseline-only resolved tasks) with an exact
 McNemar test, not just two headline rates. The subset is underpowered to
 detect small differences; a non-significant paired test is reported as such.
 
-`TBD(rl): final mean reward / best reward, updates completed, whether the
-mid-RL dev gate passed, and whether the RL adapter was evaluated.`
+### 5.1 GRPO attempt (negative result)
+
+We ran GRPO from the SFT adapter with `k=4`, one task per update, 8 steps,
+384 new tokens, and 20 planned updates. Only **4 updates completed** before
+the run was stopped. Loss, policy-gradient norm, and KL were exactly `0.0000`
+on every update, and the mean group reward stayed flat: `-0.136`, `-0.134`,
+`-0.140`, `-0.139` (best `-0.130`, `-0.120`, `-0.140`, `-0.135`). All four
+rollouts per task failed, so the group-centered advantages were zero and no
+gradient was applied; update 1 also produced an unparseable tool call
+(`no tool call found in model output`). Checkpoints are written every 5
+updates, so **no RL adapter exists**. The evaluated policy is therefore the
+SFT adapter; the GRPO attempt is reported as a negative result, not as an
+improvement.
 
 SFT loss curve (logged): 0.648 → 0.301 → 0.264.
 
@@ -182,9 +193,9 @@ We report only ablations the compute budget actually allows; anything not run
 is listed as not run rather than implied.
 
 - **SFT vs zero-shot base** — same 24 tasks, same harness. `TBD`
-- **SFT vs SFT+GRPO** — same 24 tasks. Enabled only if the RL dev gate
-  accepts the adapter; otherwise the SFT adapter is the final policy and we
-  report the negative result.
+- **SFT vs SFT+GRPO** — not run: GRPO produced zero gradient for 4 updates
+  and no adapter was checkpointed. The SFT adapter is the final policy; this
+  is a negative result, not an omitted ablation.
 - **Group size k** — RL v10 used k=2 and produced zero gradient because both
   rollouts failed (advantages ≈ ±0.0025); the final run uses k=4. This is a
   measured debugging result, not a clean ablation.

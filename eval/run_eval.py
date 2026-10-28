@@ -626,7 +626,7 @@ def evaluate_task(
         record["error"] = f"checkout failed: {type(exc).__name__}: {exc}"
         record["reason"] = record["error"]
         return record
-    record["repo"] = str(repo)
+    record["checkout"] = str(repo)
 
     base, targets = task_test_config(task)
 
