@@ -291,6 +291,18 @@ def test_categorize_test_environment_issue() -> None:
     assert categorize(record) == "test_environment_issue"
 
 
+def test_categorize_environment_setup_failure_is_not_a_policy_error() -> None:
+    """A broken task venv fails before inference; do not blame the policy."""
+    record = {
+        "status": "error",
+        "resolved": False,
+        "patch_valid": False,
+        "test_status": "error",
+        "error": "environment setup failed: RuntimeError: pip install failed for pydata/xarray",
+    }
+    assert categorize(record) == "test_environment_issue"
+
+
 def test_main_dump_trajectories_survives_early_exit_records(tmp_path, monkeypatch) -> None:
     """Env/checkout early exits have no 'trajectory' key — the run must not crash
     (kernel eval v2 died with KeyError on the first Kaggle task)."""

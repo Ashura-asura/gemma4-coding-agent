@@ -36,6 +36,11 @@ def categorize(record: dict[str, Any]) -> str:
     if record.get("resolved"):
         return "resolved"
     if record.get("status") == "error":
+        # Environment setup is not a policy failure: a task whose venv cannot
+        # be built fails before the model is ever asked for a tool call.
+        error = str(record.get("error") or "").lower()
+        if "environment setup failed" in error or "pip install failed" in error:
+            return "test_environment_issue"
         return "policy_error"
     if record.get("status") == "budget_exhausted":
         return "step_budget_exhaustion"
