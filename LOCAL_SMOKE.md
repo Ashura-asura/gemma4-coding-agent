@@ -29,10 +29,10 @@ A Q3_K_M GGUF (3.78 GB) stays mmap'd, so pages are evictable instead.
 - Prompt: the same tokenizer, chat template, `default_tool_specs()` and
   `parse_tool_call()` as `eval/run_eval.py`; prompt capped at 2,048 tokens
   (head 512 + tail 1,536, matching `cap_prompt_tokens`); greedy decoding.
-- Budget: 3 steps, 64 new tokens per call, 300 s test limit. The paper used
-  12 steps / 512 tokens; the smaller budget is deliberate (protect the
-  laptop) and makes this descriptive only.
-- Arms were run one at a time, base first, then SFT.
+- Budget: the first smoke used 3 steps and 64 new tokens; the fairer rerun
+  used 8 steps and 256 tokens (both below the paper's 12 steps / 512 tokens,
+  deliberately, to protect the laptop). Arms were run one at a time, base
+  first, then SFT.
 
 Commands:
 
@@ -42,7 +42,7 @@ python scripts/local_gguf_smoke.py --model base
 python scripts/local_gguf_smoke.py --model sft
 ```
 
-## Results
+## First smoke (3 steps, 64 tokens)
 
 | task | base | SFT |
 | --- | --- | --- |
@@ -54,7 +54,34 @@ Peak `llama-server` RSS was 3.64 GB (base) and 3.89 GB (SFT); the minimum
 system-available RAM observed was 1.80 GB (base) and 1.96 GB (SFT). No swap
 was entered and both processes shut down cleanly.
 
-Qualitative notes from the three allowed generations per task:
+## Fairer budget (8 steps, 256 tokens)
+
+Q4_K_M was tried first, but at 8 steps it grew to 5.39 GiB RSS and tripped
+the 5.5 GB guard (the laptop itself stayed responsive: 1.22 GB free). The
+fair run therefore used Q3_K_M, which peaked at 4.78 GB.
+
+| task | base | SFT |
+| --- | --- | --- |
+| `django__django-10390` | `budget_exhausted`, 6 steps, 0 resolved, 557 s | `budget_exhausted`, 8 steps, 0 resolved, 559 s |
+| `django__django-10531` | `budget_exhausted`, 6 steps, 0 resolved, 558 s | `budget_exhausted`, 8 steps, 0 resolved, 475 s |
+| **resolved** | **0/2** | **0/2** |
+
+Peak `llama-server` RSS was 4.54 GB (base) and 4.78 GB (SFT); minimum
+available RAM was 2.25 GB and 2.13 GB. No swap.
+
+What the extra budget changed:
+
+- Base explored more (searches, reads, one `run_tests`) but never edited a
+  file. On `10390` it ran the tests against an unmodified tree.
+- SFT edited on both tasks. On `10390` its diff was **cut off at 256 tokens**
+  and rejected seven times as `diff is truncated inside a hunk`. On `10531`
+  it applied a real patch, ran the tests (fail), then looped re-applying the
+  already-applied patch.
+- This is a harness-budget artifact, not a capability result: the paper used
+  **512** new tokens, and the same adapter still scored 0/20 there. Raising
+  the local limit would reproduce the paper's budget, not fix the policy.
+
+Qualitative notes from the earlier 3-step run:
 
 - `10390`: base searched for `test_truncate_to_dst_ends_stockholm` (no
   matches), then `AmbiguousTimeError`; SFT read

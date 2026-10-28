@@ -60,6 +60,11 @@ MIN_AVAIL_MB = 500
 MAX_RSS_MB = 5500
 
 
+class SmokeAbort(BaseException):
+    """Guard tripped; derives from BaseException so the agent loop cannot
+    swallow it as a recoverable policy error."""
+
+
 class Guard:
     """Abort before the machine is pushed into swap."""
 
@@ -84,7 +89,7 @@ class Guard:
         if vm.available < MIN_AVAIL_MB * 2**20 or rss > MAX_RSS_MB * 2**20:
             if kill_on_fail and self.proc is not None:
                 self.proc.kill()
-            raise MemoryError(
+            raise SmokeAbort(
                 f"aborted at {where}: avail={vm.available / 2**30:.2f} GB, "
                 f"rss={rss / 2**30:.2f} GB"
             )
@@ -221,7 +226,11 @@ def main() -> int:
 
     tokenizer = AutoTokenizer.from_pretrained(ADAPTER)
     guard = Guard()
-    proc = start_server(args.model, guard)
+    try:
+        proc = start_server(args.model, guard)
+    except SmokeAbort as exc:
+        print(f"ABORT: {exc}", flush=True)
+        return 2
     try:
         if args.load_only:
             # one tiny generation proves the graph + lora path works
@@ -255,7 +264,7 @@ def main() -> int:
                         limits=Limits.for_tests(300),
                         dump_trajectory=True,
                     )
-                except MemoryError as exc:
+                except SmokeAbort as exc:
                     print(f"ABORT: {exc}", flush=True)
                     return 2
                 trajectory = record.pop("trajectory", None)
