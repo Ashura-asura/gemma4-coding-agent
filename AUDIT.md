@@ -38,10 +38,12 @@ unmodified baseline in the environment used for this audit (pre-existing, unrela
 
 ## Residual risks / not done
 
-* **Nothing GPU- or model-dependent was executed.** The native tool-call parser follows
-  the documented Gemma 4 format but has never seen the real tokenizer; run one
-  `apply_chat_template → generate → decode → parse_tool_call` round trip first
-  (`train/tests/test_gemma_processor.py` is gated on network access).
+* **Model-dependent behaviour is now measured, and it is worse than the
+  harness checks could reveal.** Eval v6 ran the real Gemma 4 tokenizer and
+  parser on 24 tasks: the SFT adapter emits valid tool calls but repeats the
+  same rejected call 10–12 times and never submits, and the zero-shot base
+  emits unparseable prose in 6/20 episodes and OOMs in 12/20. Both arms
+  resolve 0/20. The parser round trip works; the policy does not.
 * `SANDBOX_FS_ISOLATION=required` needs `CAP_SYS_ADMIN` or unprivileged user namespaces.
   If Kaggle's kernel image forbids both, the run aborts (by design); `best_effort` runs
   but results are **not trustworthy**. Reads of host files and seccomp are not covered —
@@ -53,5 +55,19 @@ unmodified baseline in the environment used for this audit (pre-existing, unrela
   help most. `p2p_targets` need a data rebuild from raw SWE-bench.
 * Malformed generations are retried but not penalised in the RL loss (their ids are not
   recorded).
+* **Base-arm OOM is a measurement confound, not a solved bug.** The base policy reads
+  whole files (0/48 ranged reads) and drives its prompt to the 12k-token cap, so 12 of 20
+  scored episodes died with `CUDA out of memory`. Its 0/20 is not a clean capability
+  estimate; only the 8 pairs with no infrastructure failure in either arm are comparable,
+  and those are 0/8 vs 0/8. A fair base run needs a policy-side context budget (or paged
+  attention), not a bigger card.
+* **The SFT data has no recovery supervision.** All 515 trajectories submit immediately
+  after a passing `run_tests` (515/515), and the only tool error they contain is
+  `patch does not apply` (125 observations). Wrong paths — the single largest eval failure
+  (11/20) — never appear as a recoverable error. Training on rejected-action/recovery pairs
+  is the highest-value data fix and was not run.
+* **The headline eval is 24 tasks.** Both arms at 0/20 gives a 95% Wilson upper bound of
+  16.1%; the design can rule out a large effect, not a small one, and McNemar is degenerate
+  with zero discordant pairs.
 * Throughput: still serial HF `generate`; moving rollouts to vLLM is the largest remaining
   speed-up.

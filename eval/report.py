@@ -16,9 +16,15 @@ FAILURE_CATEGORIES = (
     "wrong_file",
     "incomplete_patch",
     "test_environment_issue",
+    "infrastructure_error",
     "step_budget_exhaustion",
     "policy_error",
 )
+
+# A CUDA OOM is a hardware/context limit, not a policy decision: the episode
+# is truncated by the machine before the policy can submit. Keep it out of
+# the policy-failure counts so the paper does not blame the model for it.
+_OOM_MARKERS = ("outofmemoryerror", "cuda out of memory")
 
 
 def load_records(path: str | Path) -> list[dict[str, Any]]:
@@ -41,6 +47,8 @@ def categorize(record: dict[str, Any]) -> str:
         error = str(record.get("error") or "").lower()
         if "environment setup failed" in error or "pip install failed" in error:
             return "test_environment_issue"
+        if any(marker in error for marker in _OOM_MARKERS):
+            return "infrastructure_error"
         return "policy_error"
     if record.get("status") == "budget_exhausted":
         return "step_budget_exhaustion"

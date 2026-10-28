@@ -303,6 +303,18 @@ def test_categorize_environment_setup_failure_is_not_a_policy_error() -> None:
     assert categorize(record) == "test_environment_issue"
 
 
+def test_categorize_cuda_oom_is_infrastructure_not_a_policy_error() -> None:
+    """A 16 GiB T4 can run out of memory mid-episode; that is not a decision."""
+    record = {
+        "status": "error",
+        "resolved": False,
+        "patch_valid": False,
+        "test_status": "error",
+        "error": "policy raised OutOfMemoryError: CUDA out of memory. Tried to allocate 2.12 GiB",
+    }
+    assert categorize(record) == "infrastructure_error"
+
+
 def test_main_dump_trajectories_survives_early_exit_records(tmp_path, monkeypatch) -> None:
     """Env/checkout early exits have no 'trajectory' key — the run must not crash
     (kernel eval v2 died with KeyError on the first Kaggle task)."""

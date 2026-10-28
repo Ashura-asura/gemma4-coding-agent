@@ -1,8 +1,9 @@
 # Post-training Gemma 4 into an offline software-engineering agent on a free T4
 
-**Paper Track submission draft — work in progress.**
-All headline numbers marked `TBD` are filled from the final Kaggle runs; the
-method, compute accounting and failure analysis are final unless noted.
+**Paper Track submission — final.**
+Headline numbers are from the completed held-out run (kernel
+`ashuraasura/gemma-4-eval-holdout-architecture-2-6`, 11 h 19 m on one T4).
+The result is negative and is reported as measured.
 
 ## Abstract
 
@@ -12,9 +13,15 @@ fine-tuning (SFT) on 515 compacted, test-verified tool-use trajectories
 (from 870 built), followed by a GRPO attempt on a disjoint 267-task
 training pool carved from 291 verified RL tasks (a 24-task dev slice is
 removed before training), with a test-execution reward. All training and
-evaluation run on a single free-tier Kaggle T4 (16 GiB). We report resolved rate, patch validity and failure modes
-on a frozen, repo-stratified 24-task subset of a 291-task held-out split, and
-we state the compute-driven reductions explicitly. `TBD: one-sentence result.`
+evaluation run on a single free-tier Kaggle T4 (16 GiB). On a frozen,
+repo-stratified 24-task subset of a 291-task held-out split, both the adapter
+and the zero-shot base resolve **0 of the 20 tasks whose environments build**
+(0.0%, 95% Wilson 0.0–16.1%); with no discordant tasks the exact McNemar
+test is degenerate (p = 1.0). SFT changes *how* the agent fails without
+changing the rate: the adapter keeps the tool protocol but collapses into
+repeating one rejected action (18 of 19 episodes with at least four calls use
+at most three distinct calls) and never submits, while the base model emits
+unparseable text in 6 of 20 episodes and exhausts the 16 GiB card in 12 of 20.
 
 ## 1. Introduction
 
@@ -34,7 +41,8 @@ Our contributions are:
    complete. The offload is E4B-specific; sliced/chunked cross-entropy is
    the part that generalizes to other sizes.
 3. An honest, compute-bounded evaluation on a frozen stratified subset, with
-   sandbox-isolation caveats reported alongside every number.
+   sandbox-isolation caveats reported alongside every number and a null
+   result reported as a null result.
 
 ## 2. Related work
 
@@ -145,6 +153,7 @@ the frozen SFT adapter. Budget after measurement on the T4:
 | SFT data | 515 compacted trajectories (from 870 built; 355 over length budget) |
 | RL pool | 291 verified tasks; 24-task dev slice, 267 for training |
 | Eval | 24-task frozen, repo-stratified subset; 12 steps; 512 new tokens |
+| Eval sample | 24 attempted → 4 env failures → 20 scored → 8 clean pairs (no OOM either arm) |
 | Metrics | resolved rate, patch validity, steps-to-submit, failure category |
 | Sandbox | `best_effort` isolation on Kaggle (seccomp blocks `unshare`) |
 
@@ -156,24 +165,92 @@ none skipped. This blocks the obvious reward hack of editing the tests.
 
 ## 5. Results
 
-`TBD(final-eval): adapter vs base on the 24-task subset.`
+Table 1. Held-out results on the frozen 24-task subset (12 steps, 512 new
+tokens, greedy decoding). "Scored" excludes tasks whose virtualenv could not
+be built; both arms see exactly the same tasks.
 
-Table 1. Held-out results (24 tasks; 12 steps; 512 new tokens).
+| Policy | Attempted | Env. failure | CUDA OOM | Scored | Resolved (95% Wilson) | Patches submitted |
+|---|---|---|---|---|---|---|
+| Base Gemma 4 E4B, zero-shot | 24 | 4 | 12 | 20 | 0/20 = 0.0% (0.0–16.1%) | 0 |
+| + QLoRA SFT | 24 | 4 | 0 | 20 | 0/20 = 0.0% (0.0–16.1%) | 0 |
+| + GRPO | not evaluated — no learning signal, no checkpoint | — | — | — | — | — |
 
-| Policy | Resolved | Resolved rate (95% Wilson CI) | Patch validity | Avg steps to submit |
-|---|---|---|---|---|
-| Base Gemma 4 E4B (zero-shot) | TBD | TBD | TBD | TBD |
-| + QLoRA SFT | TBD | TBD | TBD | TBD |
-| + GRPO | not evaluated — no learning signal, no checkpoint | — | — | — |
+The run is a null result. Neither policy resolved a task, so there is no
+patch-validity or steps-to-submit statistic to report, and the paired
+comparison contains no discordant tasks (treatment-only 0, baseline-only 0,
+exact McNemar p = 1.0). We state this as measured rather than reframing it.
 
-At 24 tasks the confidence intervals are wide by construction: **3/24
-resolved is 12.5% with a 95% Wilson interval of roughly 4–31%**. We therefore
-report the raw counts, the per-repository breakdown, and a paired per-task
-comparison (treatment-only vs baseline-only resolved tasks) with an exact
-McNemar test, not just two headline rates. The subset is underpowered to
-detect small differences; a non-significant paired test is reported as such.
+Twelve of the twenty base episodes ended in CUDA OOM, so the 20-task rate is
+not a clean capability estimate for the base policy. Restricting to the eight
+pairs where neither arm hit an infrastructure failure gives 0/8 = 0.0%
+(95% Wilson 0.0–32.4%) in both arms, again with zero discordant pairs. The
+OOM is a property of the base policy's context behaviour (§5.2), not of an
+asymmetric harness: both arms use the same 4-bit loader, the same 12k-token
+prompt cap and the same per-step cache release.
 
-### 5.1 GRPO attempt (negative result)
+Per repository, on the 20 scored pairs, both arms are 0/4 django, 0/4 pylint,
+0/3 pytest, 0/3 sphinx, 0/3 sympy, 0/2 flask and 0/1 requests.
+
+### 5.1 Why the adapter never submits
+
+Table 2. Tool use over the 20 scored episodes per arm.
+
+| Signal | QLoRA SFT | Base |
+|---|---|---|
+| tool calls | 229 | 123 |
+| `read_file`, ranged / whole-file | 119 / 22 | 0 / 48 |
+| `edit_file` | 79 | 2 |
+| `search_repo` | 2 | 70 |
+| `run_tests` | 7 | 2 |
+| `submit` | 0 | 1 (empty arguments) |
+| episodes with ≥4 calls using ≤3 distinct calls | 18/19 | 2/16 |
+| episodes that never submit | 20/20 | 19/20 |
+| median completion tokens per call | 36 | 92 |
+
+The adapter mostly holds the tool protocol — all 20 scored episodes emit
+parseable tool calls and only one ends on an unparseable generation — but it
+is stuck. Eleven episodes hit
+`error: path does not exist` as their first tool error (for example
+`pytest/_matchers.py` instead of `src/_pytest/_matchers.py`), five hit a hunk
+whose context does not match the file, two hit a malformed hunk
+(`@@ -222,10 +222,12` followed by 8 old and 10 new lines), and two produced no
+tool error at all. In 18 of the 19 episodes that made at least four calls, the
+policy used at most three distinct calls across twelve steps; most used one or
+two. It re-issues the rejected action verbatim: `django-10390` repeats a
+malformed hunk 11 times, `pytest-10081` repeats the same non-existent-path
+read 11 times, and `requests-5087` alternates one edit with `run_tests` six
+times while the tests keep failing. Completion lengths are 36 tokens at the
+median, so the 512-token cap is not what stops it; one episode ends on a diff
+that stops mid-file and cannot be parsed.
+
+The demonstrations explain the shape of this failure. All 515 training
+trajectories call `submit` immediately after a `run_tests` result of
+`status=pass` (515/515), so the policy learned a success-conditioned
+transition into `submit` and has no branch that reaches `submit` from a
+failing state. The training set also contains exactly one class of tool
+error — `patch does not apply` — in 125 observations across 125 trajectories,
+and no example of a path-resolution error, which is the most common eval
+failure (11/20). Supervision alone does not explain the loop, however: five
+episodes fail with the same `patch does not apply` class that the data does
+contain, and the adapter still repeats it 10–12 times instead of revising.
+Imitating a successful trajectory does not by itself teach recovery.
+
+### 5.2 Base arm: context growth, then OOM
+
+The base arm fails differently. It never uses line ranges (0 of 48 reads;
+the adapter uses ranges in 119 of 141), calls `search_repo` 70 times, and
+writes longer completions (median 92 tokens). Its prompts therefore grow much
+faster and run into the 12k-token cap, and 12 of 20 episodes died with
+`CUDA out of memory` between steps 3 and 11. Of the remaining eight, six
+emitted prose instead of a tool call (`no tool call found in model output`)
+and two exhausted the step budget. Its single `submit` carried empty
+arguments.
+
+We do not conclude that the base model is incapable: 12 of 20 episodes were
+truncated by memory before it could submit. The comparison we can defend is
+the eight clean pairs, where both arms resolve 0/8.
+
+### 5.3 GRPO attempt (negative result)
 
 We ran GRPO from the SFT adapter with `k=4`, one task per update, 8 steps,
 384 new tokens, and 20 planned updates. Only **4 updates completed** before
@@ -194,7 +271,11 @@ SFT loss curve (logged): 0.648 → 0.301 → 0.264.
 We report only ablations the compute budget actually allows; anything not run
 is listed as not run rather than implied.
 
-- **SFT vs zero-shot base** — same 24 tasks, same harness. `TBD`
+- **SFT vs zero-shot base** — run on the same 24 tasks with the same harness.
+  Both arms resolve 0/20 scored tasks; there are 0 discordant pairs and the
+  exact McNemar p is 1.0. This is a null result, not evidence of equivalence:
+  at this sample size the design can only detect a large difference, and the
+  base arm additionally lost 12/20 episodes to CUDA OOM.
 - **SFT vs SFT+GRPO** — not run: GRPO produced zero gradient for 4 updates
   and no adapter was checkpointed. The SFT adapter is the final policy; this
   is a negative result, not an omitted ablation.
@@ -208,34 +289,43 @@ is listed as not run rather than implied.
 ## 7. Failure modes
 
 Categories are assigned from the rollout record, the test log, and the gold
-patch (for file overlap):
+patch (for file overlap). Counts are over the 24 attempted tasks per arm:
 
-| Category | Definition | Observed |
-|---|---|---|
-| `invalid_patch` | submitted patch is empty, malformed, or does not apply | TBD |
-| `wrong_file` | valid patch that touches no file in the task's gold patch | TBD |
-| `incomplete_patch` | valid patch that touches a gold file but does not fix the tests | TBD |
-| `test_environment_issue` | dependency/venv failure before policy action | TBD |
-| `step_budget_exhaustion` | no `submit` within 12 steps | TBD |
-| `policy_error` | generation/parse error, including CUDA OOM | eval v4: 3/4 episodes |
+| Category | SFT | Base | Definition |
+|---|---|---|---|
+| `step_budget_exhaustion` | 19 | 2 | no `submit` within 12 steps |
+| `policy_error` | 1 | 6 | episode ended with output containing no parseable tool call |
+| `infrastructure_error` | 0 | 12 | episode killed by CUDA OOM before submission |
+| `test_environment_issue` | 4 | 4 | virtualenv build failed before inference |
+| `invalid_patch` / `wrong_file` / `incomplete_patch` | 0 | 0 | never reached — no patch was ever submitted |
+
+The last row is not an oversight: because neither arm submitted a patch, the
+patch-level taxonomy that the harness implements has no observations in this
+run. We report it empty rather than assigning categories to episodes that
+never produced a diff.
 
 Eval v4 (pre-fix) was diagnostic: the SFT adapter OOMed after 14–21 steps
-because the 5.25 GiB PLE table stayed resident while the KV cache grew; the
-base policy OOMed at step 3 on one task and submitted at step 11 on another.
-The fix (PLE host offload, 12k-token head+tail prompt cap, per-step cache
-release) was smoke-tested in eval v5 (four tasks, no OOM; one xarray
-environment failure) and is used for the final v6 run. v5 itself is not
-reportable: it used the earlier dtype path and only four tasks.
+because the 5.25 GiB PLE table stayed resident while the KV cache grew. The
+fix (PLE host offload, 12k-token head+tail prompt cap, per-step cache release)
+was smoke-tested in eval v5 and removed SFT-arm OOM entirely in v6. It did not
+remove base-arm OOM, which is driven by that policy's whole-file reads rather
+than by model size (§5.2).
 
 ## 8. Limitations and honest scope
 
-- **Statistical power.** The full 291-task × 2-policy holdout is
-  ~100+ GPU-hours at measured speed and was not run. Headline numbers are on
-  the committed 24-task stratified subset. At n=24 the 95% Wilson interval
-  for 3/24 resolved is roughly 4–31%; we report counts, intervals, per-repo
-  breakdowns and paired discordant-task counts, and we do not claim a
-  significant SFT-vs-base difference unless the exact McNemar test supports
-  it.
+- **Statistical power and a null result.** The full 291-task × 2-policy
+  holdout is ~100+ GPU-hours at measured speed and was not run. Headline
+  numbers are on the committed 24-task stratified subset. Both arms resolved
+  0 of 20 scored tasks (95% Wilson 0.0–16.1%), so the exact McNemar test has
+  no discordant pairs and returns p = 1.0. This run can rule out a large
+  effect and nothing smaller; we do not claim that SFT and base are
+  equivalent, only that this measurement does not separate them.
+- **Base-arm OOM confound.** 12 of 20 base episodes ran out of GPU memory
+  before submitting, because the base policy reads whole files (0/48 ranged
+  reads) and pushes its prompt to the 12k-token cap. Its 0/20 is therefore
+  not a fair capability estimate; the defensible comparison is the eight
+  clean pairs, where both arms are 0/8. A fair base evaluation needs a
+  policy-side context budget, not a larger card.
 - **Sandbox isolation.** Kaggle blocks `unshare`; filesystem/network
   isolation is `best_effort`. A malicious policy could in principle reach the
   host filesystem. Reward and eval numbers are therefore not fully isolated.
@@ -244,6 +334,14 @@ reportable: it used the earlier dtype path and only four tasks.
 - **SFT data selection.** 355 of 870 built trajectories exceeded the
   16k-character compaction budget and were excluded. If long trajectories
   correlate with harder tasks, the adapter underrepresents them.
+- **Supervision coverage.** The 515 retained trajectories contain exactly one
+  tool-error class (`patch does not apply`, 125 observations) and no
+  path-resolution errors, although wrong paths cause 11 of the 20 scored SFT
+  failures. Every trajectory submits only after a passing test run. The
+  adapter was therefore never shown how to recover from the dominant eval
+  failure, and the paper reports that as a data-construction defect rather
+  than a model property. Training on rejected-action/recovery pairs is the
+  obvious next step and was not run.
 - **Holdout overlap.** The 291-task holdout contains 23 tasks that share a
   base commit or issue text with the SFT/RL pools; they are excluded from
   the headline 24-task subset, so the subset is not a uniform sample of the
@@ -273,7 +371,13 @@ reportable: it used the earlier dtype path and only four tasks.
 
 ## 9. Reproducibility
 
-- Code: this repository (`gemma4-coding-agent`), commit `TBD(final)`.
+- Code: this repository (`gemma4-coding-agent`). The eval kernel ran commit
+  `1f2cc9b` with `run_eval` sha `2fb5f2451dd7`; the paper, the analysis script
+  (`eval.final_analysis`) and the reporting fixes are at repository HEAD.
+- Numbers: `python -m eval.final_analysis sft.jsonl base.jsonl --sft-traj
+  sft_traj.jsonl --base-traj base_traj.jsonl --sft-data
+  data/sft_trajectories.compact.jsonl` reproduces Tables 1–2 and the
+  supervision counts from the released JSONL.
 - Kaggle kernels: `ashuraasura/gemma-4-qlora-sft-architecture-2-4`,
   `ashuraasura/gemma-4-grpo-rl`,
   `ashuraasura/gemma-4-eval-holdout-architecture-2-6`.
@@ -289,6 +393,7 @@ reportable: it used the earlier dtype path and only four tasks.
 |---|---|
 | SFT | 22 kernel versions; PLE offload frees 5.25 GiB; CE chunk 128 |
 | Eval (pre-fix) | ~50–80 s/step; 19.5 min for a 21-step SFT episode |
-| Eval OOM | 14–21 steps (SFT), 3 steps (base, one task) |
+| Final eval, SFT arm | 9,801 s (2 h 43 m) for 24 tasks, 0 OOM |
+| Final eval, base arm | remainder of an 11 h 19 m kernel (≈8 h 30 m), 12 OOM |
 | RL rollout | 619 s for 2 rollouts × 6 steps + one update (k=2 smoke) |
-| Kaggle quota | 24 h 17 m available of 30 h at the start of the final runs |
+| Kaggle quota | 24 h 17 m available of 30 h before the final runs; 11 h 19 m used by v6 |
