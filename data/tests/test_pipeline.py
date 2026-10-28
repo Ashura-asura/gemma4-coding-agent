@@ -452,3 +452,22 @@ def test_pip_host_skips_interpreter_without_pip(monkeypatch) -> None:
 
     assert common._pip_host() == "good-python"
     assert [c[0] for c in calls] == ["bad-python", "good-python"]
+
+
+def test_headline_holdout_subset_excludes_training_overlap() -> None:
+    """AUDIT M5: the 24-task headline subset must not share a base commit or
+    issue text with the SFT/RL pools; otherwise the comparison is contaminated.
+    """
+    root = Path(__file__).resolve().parents[2]
+    subset = [json.loads(line) for line in (root / "data/holdout_eval_subset.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    sft = [json.loads(line) for line in (root / "data/sft_trajectories.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    rl = [json.loads(line) for line in (root / "data/rl_task_pool.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(subset) == 24
+
+    ids = {r["task_id"] for r in sft} | {r["task_id"] for r in rl}
+    commits = {(r["repo"], r["base_commit"]) for r in sft} | {(r["repo"], r["base_commit"]) for r in rl}
+    issues = {r["issue"].strip() for r in sft} | {r["issue"].strip() for r in rl}
+    for row in subset:
+        assert row["task_id"] not in ids
+        assert (row["repo"], row["base_commit"]) not in commits
+        assert row["issue"].strip() not in issues
