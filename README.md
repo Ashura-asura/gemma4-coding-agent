@@ -20,14 +20,16 @@ being built.
 | 1. Sandbox + tool interface | **done** — adversarial suite green on win32 + Linux (WSL); 5 tools + loop wired; eval harness runs end-to-end with a null policy |
 | 2. Data pipeline | **done** — 9 repos end-to-end; runnable pool 1786; holdout frozen at 291; RL pool 291; SFT build finished: **870 test-verified trajectories** (§8.2 gate 500–1000 ✓), mirrored to the `gemma4-coding-agent-repo` Kaggle dataset |
 | 3. SFT (QLoRA) | **done** — Kaggle kernel v22 on E4B: 33/33 steps, 515 trajectories, loss 0.648→0.301→0.264 (no collapse), grad_norm 0.41→0.19, adapter `ashuraasura/sft-adapter`. OOM fixed by per-layer-embedding offload (~5.25 GiB to host RAM) + CE chunk 128. |
-| 4. RL (GRPO) | **validated on Kaggle (dry-run + probe)** — `train/rl/` reward + rollout worker + GRPO trainer (group-normalized PG, k3-KL to the frozen SFT baseline, shared-policy rollouts, resumable every-25-update checkpoints), `configs/rl_config.yaml`, `scripts/run_rl.sh`; smoke run in flight post-SFT |
-| 5. Eval + ablations | **in progress** — `kaggle/eval.ipynb` scores SFT adapter vs zero-shot base on the frozen 291-task holdout (smoke `EVAL_LIMIT=10`, full `EVAL_LIMIT=0`) |
+| 4. RL (GRPO) | **validated on Kaggle** — reward + rollout worker + GRPO trainer (group-normalized PG, k3-KL to the frozen SFT baseline, shared-policy rollouts, resumable checkpoints). RL v9 smoke: real rollouts, 148s/84s for 1 rollout x 4 steps. Budget reduced for the T4: `k=4`, `batch_tasks=1`, `max_steps=8`, 20 updates. |
+| 5. Eval + ablations | **running** — `kaggle/eval.ipynb` scores SFT adapter vs zero-shot base on the *same* tasks. Measured: ~50–80 s/step on T4; full 291×2 holdout would be ~100+ GPU-hours, so the headline eval uses the committed 24-task stratified subset (`data/holdout_eval_subset.jsonl`, round-robin by repo) with the reduction disclosed. Eval v4 exposed a CUDA OOM at 14–21 steps; fixed by PLE host-RAM offload + 12k prompt cap. |
 | 6. Write-up | not started |
 
-Rung 0 (`ARCHITECTURE.md` §8.1) is being measured by the eval kernel on the
-Kaggle GPU host (base/instruct zero-shot vs SFT adapter, same holdout slice).
+Rung 0 (`ARCHITECTURE.md` §8.1) is measured by the eval kernel on the
+Kaggle GPU host (base/instruct zero-shot vs SFT adapter, same tasks).
 Sandbox isolation on Kaggle is `best_effort` (unshare is seccomp-blocked) and
-is disclosed with every number.
+is disclosed with every number. The 24-task subset is sampled deterministically:
+holdout rows are bucketed by repo and taken round-robin (4 django, 4 xarray,
+4 pylint, 3 pytest, 3 sphinx, 3 sympy, 2 flask, 1 requests).
 
 Kaggle notebooks (private kernels, `kaggle/` is the source of truth):
 SFT → <https://www.kaggle.com/code/ashuraasura/gemma-4-qlora-sft-architecture-2-4>,

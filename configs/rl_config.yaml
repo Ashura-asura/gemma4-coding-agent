@@ -14,9 +14,9 @@ rollout:
   dev_size: 24                # tasks removed from training and used only by the mid-RL gate
   dev_eval_tasks: 12          # tasks scored per gate evaluation (k=1, low temperature)
   dev_temperature: 0.2
-  k: 8                        # group size: trajectories per task
-  max_steps: 20               # step budget per episode (§2.2)
-  max_tokens_per_step: 768    # a tool call + short reasoning; 2048 only wastes generation time
+  k: 4                        # group size; 8x2 tasks/update costs ~5-8 h/update on a T4
+  max_steps: 8                # measured: base submits by step 11 on eval; RL starts from SFT
+  max_tokens_per_step: 384    # a tool call + short reasoning; 2048 only wastes generation time
   temperature: 1.0
   wall_seconds: 600           # per test run; CPU limit is aligned to this (Limits.for_tests)
 
@@ -33,18 +33,18 @@ advantage:
 
 training:
   learning_rate: 1.0e-5
-  batch_tasks: 2              # tasks per update step; k rollouts each
-  num_updates: 60
+  batch_tasks: 1              # 2x8 rollouts/update exceeds the 12 h session (§5)
+  num_updates: 20
   train_steps_per_episode: 6  # assistant steps per episode used in the loss (the final step always)
   kl_coeff: 0.01              # KL to frozen SFT reference, guards collapse (§8.3)
   max_grad_norm: 1.0
   precision: bfloat16
   seed: 0
-  max_wall_hours: 11          # stop + checkpoint before the Kaggle session limit (null = unlimited)
+  max_wall_hours: 8           # stop + checkpoint before the Kaggle session limit (null = unlimited)
 
 checkpointing:
   output_dir: checkpoints/rl
-  save_every_updates: 10      # free-tier sessions have hard limits (§5)
+  save_every_updates: 5       # free-tier sessions have hard limits (§5)
   resume_from: null
   eval_dev_every_updates: 10  # catch flat/negative trend early (§8.2 mid-RL gate)
 
