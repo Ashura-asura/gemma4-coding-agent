@@ -6,6 +6,7 @@ __pycache__/
 venv/
 
 # artifacts — regenerate, never commit
+paper/paper.html
 checkpoints/sft/*
 checkpoints/rl/*
 !checkpoints/sft/.gitkeep

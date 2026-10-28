@@ -209,8 +209,9 @@ Categories are assigned from the rollout record and the test log:
 
 | Category | Definition | Observed |
 |---|---|---|
-| `wrong_file` | edits a file unrelated to the failing test | TBD |
-| `incomplete_patch` | patch applies but does not fix the failure | TBD |
+| `invalid_patch` | submitted patch is empty, malformed, or does not apply | TBD |
+| `wrong_file` | valid patch that touches no file in the task's gold patch | TBD |
+| `incomplete_patch` | valid patch that touches a gold file but does not fix the tests | TBD |
 | `test_environment_issue` | dependency/venv failure before policy action | TBD |
 | `step_budget_exhaustion` | no `submit` within 12 steps | TBD |
 | `policy_error` | generation/parse error, including CUDA OOM | eval v4: 3/4 episodes |
@@ -219,7 +220,9 @@ Eval v4 (pre-fix) was diagnostic: the SFT adapter OOMed after 14–21 steps
 because the 5.25 GiB PLE table stayed resident while the KV cache grew; the
 base policy OOMed at step 3 on one task and submitted at step 11 on another.
 The fix (PLE host offload, 12k-token head+tail prompt cap, per-step cache
-release) is validated by eval v5 and used for all final numbers.
+release) was smoke-tested in eval v5 (four tasks, no OOM; one xarray
+environment failure) and is used for the final v6 run. v5 itself is not
+reportable: it used the earlier dtype path and only four tasks.
 
 ## 8. Limitations and honest scope
 
@@ -242,9 +245,15 @@ release) is validated by eval v5 and used for all final numbers.
   base commit or issue text with the SFT/RL pools; they are excluded from
   the headline 24-task subset, so the subset is not a uniform sample of the
   full holdout. Public SWE-bench pre-training exposure remains possible.
+- **Task-environment coverage.** Four xarray tasks in the subset pin
+  `pandas==1.5.3` with `numpy<2`; that stack has no Python 3.13 wheel and
+  cannot be built on the Kaggle image. Both arms fail at environment setup,
+  so these tasks contribute no policy signal and the effective paired sample
+  is 20 tasks. They are reported as environment failures, not as policy
+  failures, and are not silently dropped from the attempted count.
 - **Decoding.** The final paired comparison uses greedy decoding
   (temperature 0) so each task has one fixed outcome for McNemar; sampling
-  variance at temperature 0.2 is not measured.
+  variance and seed variance are not measured.
 - **Single seed, single run.** No error bars across seeds.
 - **Adapter portability.** LoRA weights are tied to E4B's layer shapes and
   cannot be loaded into a 12B or other-size model. A larger model requires
